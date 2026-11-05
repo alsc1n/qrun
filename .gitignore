@@ -1,0 +1,13 @@
+/target
+
+# AI 工具与工作流，只留在本地
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+/.claude/
+/.forme/
+/.codegraph/
+/.agents/
+/.codex/
+/.cursor/
+/.grok/

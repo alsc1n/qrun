@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.ttf binary
+# 字体协议原文, 原样保存, 不做换行转换
+assets/fonts/*.txt binary

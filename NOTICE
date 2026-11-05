@@ -1,0 +1,12 @@
+QRun
+Copyright 2026 QRun contributors
+
+This product is built on GPUI Kit (https://github.com/longbridge/gpui-kit) and
+GPUI (https://github.com/zed-industries/zed), used under the Apache License 2.0.
+
+Interface icons are from Lucide (https://lucide.dev), bundled through
+gpui-kit-assets and used under the ISC License.
+
+The interface font is HarmonyOS Sans SC, Copyright 2021 Huawei Device Co., Ltd.,
+shipped unmodified in the fonts folder under the HarmonyOS Sans Fonts License
+Agreement (fonts/HarmonyOS_Sans_LICENSE.txt).

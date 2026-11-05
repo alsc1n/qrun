@@ -1,0 +1,14 @@
+{
+  "update": {
+    "sources": [
+      "https://github.com/alsc1n/qrun/releases",
+      "https://cnb.cool/alsc1n/qrun/-/releases"
+    ],
+    "check_interval_hours": 24,
+    "timeout_secs": 20
+  },
+  "panel": {
+    "hover_switch_delay_ms": 150
+  },
+  "installer_app_id": "{98983307-BC2C-4CD7-BBFD-3CC28C3F50A5}"
+}

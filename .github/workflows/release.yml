@@ -1,0 +1,143 @@
+# 推送 v* tag 时发版: 编译 release, 打绿色版 zip 和 Inno Setup 安装包, 上传到 GitHub Release,
+# 再镜像到 CNB (https://cnb.cool/alsc1n/qrun) 供国内下载. GitHub 是主源, CNB 同步失败只告警不影响发版.
+# latest.json 记录版本号, 各附件的 SHA-256 和更新说明 (CHANGELOG.md 当前版本一节), 应用从 releases/latest/download/latest.json 检查更新.
+# tag 必须和 Cargo.toml 的 version 一致, 不一致就停下, 不会发出版本号对不上的包.
+# 安装脚本用到 Inno 7 才自带的简体中文翻译, runner 预装的是 6.x, 所以每次现装官方 7.x.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  INNO_VERSION: 7.1.1
+  CNB_REPO: alsc1n/qrun
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 推到 CNB 要完整历史, 浅克隆推不上新仓库
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # 缓存按分支 / tag 隔离, 这个 tag 存的缓存下一个 tag 读不到; 只读 main 上 CI 存的同名缓存 (见 ci.yml), 不另存
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: false
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            Write-Output "::error::the tag is $env:GITHUB_REF_NAME but Cargo.toml says version $version"
+            exit 1
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      # 发行版说明取自 CHANGELOG.md 里 "## [版本号]" 那一节 (到下一个 "## " 为止, 去掉文末的链接定义),
+      # 用作 GitHub / CNB 发行版正文和 latest.json 的 notes; 没写这一节就停下, 不发没有说明的版本.
+      - name: Release notes
+        run: |
+          $lines = Get-Content CHANGELOG.md -Encoding utf8
+          $start = [array]::FindIndex($lines, [Predicate[string]]{ param($l) $l.StartsWith("## [$env:VERSION]") })
+          if ($start -lt 0) {
+            Write-Output "::error::CHANGELOG.md has no section '## [$env:VERSION]'"
+            exit 1
+          }
+          $end = [array]::FindIndex($lines, $start + 1, [Predicate[string]]{ param($l) $l.StartsWith('## ') })
+          if ($end -lt 0) { $end = $lines.Count }
+          $body = if ($end -gt $start + 1) { $lines[($start + 1)..($end - 1)] } else { @() }
+          $notes = (($body | Where-Object { $_ -notmatch '^\[[^\]]+\]: ' }) -join "`n").Trim()
+          if (-not $notes) {
+            Write-Output "::error::the CHANGELOG.md section for $env:VERSION is empty"
+            exit 1
+          }
+          Set-Content "$env:RUNNER_TEMP\notes.md" $notes -Encoding utf8NoBOM
+          Get-Content "$env:RUNNER_TEMP\notes.md"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Portable zip
+        run: |
+          $dir = "target\portable\QRun"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\qrun.exe, LICENSE, NOTICE, README.md $dir
+          Copy-Item assets\fonts "$dir\fonts" -Recurse
+          Compress-Archive "$dir\*" "target\portable\qrun-$env:VERSION-x64-portable.zip" -Force
+
+      - name: Install Inno Setup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "is-" + $env:INNO_VERSION.Replace('.', '_')
+          $exe = "innosetup-$env:INNO_VERSION-x64.exe"
+          gh release download $tag -R jrsoftware/issrc -p $exe -D $env:RUNNER_TEMP
+          Start-Process "$env:RUNNER_TEMP\$exe" -Wait -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$env:RUNNER_TEMP\inno"
+
+      - name: Installer
+        run: |
+          & "$env:RUNNER_TEMP\inno\ISCC.exe" "/DAppVersion=$env:VERSION" installer\qrun.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect assets
+        run: |
+          $dir = "target\dist"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "target\portable\qrun-$env:VERSION-x64-portable.zip", "target\installer\qrun-$env:VERSION-x64-setup.exe" $dir
+          $asset = { param($name) @{ name = $name; sha256 = (Get-FileHash "$dir\$name" -Algorithm SHA256).Hash.ToLower() } }
+          @{
+            version  = $env:VERSION
+            setup    = & $asset "qrun-$env:VERSION-x64-setup.exe"
+            portable = & $asset "qrun-$env:VERSION-x64-portable.zip"
+            notes    = Get-Content "$env:RUNNER_TEMP\notes.md" -Raw -Encoding utf8
+          } | ConvertTo-Json | Set-Content "$dir\latest.json" -Encoding utf8NoBOM
+          Get-Content "$dir\latest.json"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME --title "QRun $env:GITHUB_REF_NAME" --notes-file "$env:RUNNER_TEMP\notes.md" (Get-ChildItem target\dist).FullName
+
+      # 镜像到 CNB: 推代码和 tag, 建同名发行版, 逐个上传附件 (先取上传地址, PUT 文件, 再确认).
+      - name: Mirror to CNB
+        continue-on-error: true
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        run: |
+          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("cnb:$env:CNB_TOKEN"))
+          git -c "http.https://cnb.cool/.extraheader=Authorization: Basic $auth" push --force `
+            "https://cnb.cool/$env:CNB_REPO.git" refs/remotes/origin/main:refs/heads/main "refs/tags/${env:GITHUB_REF_NAME}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $api = "https://api.cnb.cool/$env:CNB_REPO/-/releases"
+          $headers = @{ Authorization = "Bearer $env:CNB_TOKEN"; Accept = "application/json" }
+          $release = Invoke-RestMethod -Method Post $api -Headers $headers -ContentType "application/json" -Body (@{
+            tag_name     = $env:GITHUB_REF_NAME
+            name         = "QRun $env:GITHUB_REF_NAME"
+            body         = (Get-Content "$env:RUNNER_TEMP\notes.md" -Raw -Encoding utf8) + "`n`n---`nGitHub 发行版的国内镜像: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:GITHUB_REF_NAME"
+            make_latest  = "true"
+          } | ConvertTo-Json)
+
+          foreach ($file in Get-ChildItem target\dist) {
+            $slot = Invoke-RestMethod -Method Post "$api/$($release.id)/asset-upload-url" -Headers $headers `
+              -ContentType "application/json" -Body (@{ asset_name = $file.Name; size = $file.Length; overwrite = $true } | ConvertTo-Json)
+            Invoke-RestMethod -Method Put $slot.upload_url -InFile $file.FullName -ContentType "application/octet-stream"
+            Invoke-RestMethod -Method Post $slot.verify_url -Headers $headers | Out-Null
+            Write-Output "uploaded $($file.Name)"
+          }

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # 和 release.yml 共用名为 release 的缓存: main 上存的缓存所有 tag 都能读, 发版时依赖不用重编.
+      # 只在 main 上存, PR 存的缓存别处读不到, 白占配额.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked -- -D warnings
+      # 编 release 而不是 debug: clippy 已经检查过能编译, 这一步主要是给发版备好 release 依赖的缓存
+      - name: Build
+        run: cargo build --release --locked

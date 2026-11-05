@@ -1,0 +1,37 @@
+[package]
+name = "qrun"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight launcher for Windows, built with Rust and GPUI"
+license = "Apache-2.0"
+repository = "https://github.com/alsc1n/qrun"
+readme = "README.md"
+keywords = ["launcher", "windows", "gpui", "productivity"]
+categories = ["gui"]
+publish = false
+
+[dependencies]
+gpui-kit = "0.9"
+image = { version = "0.25", default-features = false }
+log = "0.4"
+raw-window-handle = "0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_Graphics_Dwm", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry", "Win32_Networking_WinHttp", "Win32_Security", "Win32_System_Environment", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+# 依赖在开发构建里也开优化, GPUI 渲染才流畅; 自己的代码仍按调试编译, 改完秒级重编.
+# 依赖关掉 debug 断言, 与发布版一致: GPUI 0.3.11 的无障碍树在设置页数字框聚焦时会重复登记焦点,
+# 开断言直接 panic, 发布版只记警告.
+[profile.dev.package."*"]
+opt-level = 3
+debug-assertions = false
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true
+codegen-units = 1
