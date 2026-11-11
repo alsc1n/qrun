@@ -1,4 +1,4 @@
-//! Windows Shell: 提取文件图标, 读取快捷方式, 列出已安装应用, 启动, 打开方式, 打开所在位置.
+//! Windows Shell: 提取文件图标, 读取和创建快捷方式, 列出已安装应用, 启动, 打开方式, 打开所在位置, 拖到别的程序, 复制文件.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -9,24 +9,29 @@ use std::sync::Arc;
 
 use gpui_kit::RenderImage;
 use image::{Frame, RgbaImage};
-use windows::Win32::Foundation::{MAX_PATH, SIZE};
+use windows::Win32::Foundation::{COLORREF, HWND, MAX_PATH, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetObjectW, HGDIOBJ,
     ReleaseDC,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance, CoInitializeEx,
-    CoTaskMemFree, CoUninitialize, IPersistFile, STGM_READ,
+    CoTaskMemFree, CoUninitialize, IDataObject, IPersistFile, STGM_READ,
+};
+use windows::Win32::System::Ole::{
+    DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_NONE, IDropSource, OleFlushClipboard, OleSetClipboard,
 };
 use windows::Win32::UI::Shell::{
-    BHID_EnumItems, IEnumShellItems, IShellItem, IShellItemImageFactory, IShellLinkW, SHCreateItemFromParsingName,
-    SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, ShellExecuteW,
-    ShellLink,
+    BHID_DataObject, BHID_EnumItems, CLSID_DragDropHelper, DSH_ALLOWDROPDESCRIPTIONTEXT, IDragSourceHelper2,
+    IEnumShellItems, IShellItem, IShellItemImageFactory, IShellLinkW, SHCreateItemFromParsingName, SHDRAGIMAGE,
+    SHDoDragDrop, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    ShellExecuteW, ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{Interface, PCWSTR, w};
 
 use super::wide;
+use crate::params::PARAMS;
 
 /// 快捷方式参数的最大长度 (IShellLink 文档里的 INFOTIPSIZE).
 const LINK_ARGS_LEN: usize = 1024;
@@ -168,6 +173,97 @@ pub fn open_with(target: &Path) {
 pub fn reveal(target: &Path) {
     // explorer 只认 /select,"路径" 这种写法, 不能让 Rust 再整体加一层引号
     let _ = Command::new("explorer").raw_arg(format!("/select,\"{}\"", target.display())).spawn();
+}
+
+pub fn is_program(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+}
+
+/// 在 link 写一个指向 target 的快捷方式, 带上启动参数, 工作目录取程序所在目录. 写不了时写日志, 返回 false.
+pub fn create_shortcut(link: &Path, target: &Path, args: &str) -> bool {
+    let (link_w, target_w, args_w) = (wide(link), wide(target), wide(args));
+    let dir = target.parent().map(wide);
+    let result: windows::core::Result<()> = unsafe {
+        let shell_link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).expect("create ShellLink");
+        shell_link.SetPath(PCWSTR(target_w.as_ptr())).expect("set shortcut target");
+        shell_link.SetArguments(PCWSTR(args_w.as_ptr())).expect("set shortcut arguments");
+        if let Some(dir) = &dir {
+            shell_link.SetWorkingDirectory(PCWSTR(dir.as_ptr())).expect("set shortcut working directory");
+        }
+        shell_link.cast::<IPersistFile>().expect("ShellLink as IPersistFile").Save(PCWSTR(link_w.as_ptr()), true)
+    };
+    result.inspect_err(|e| log::warn!("创建快捷方式 {} 失败: {e}", link.display())).is_ok()
+}
+
+/// 把文件或文件夹拖到别的程序 (微信, 资源管理器等), 在主线程调用: 系统接管拖放直到松手才返回, 返回是否放下了.
+/// 只允许复制和创建快捷方式, 不允许移动, 拖到资源管理器里不会把原文件挪走. 拿不到目标 (如已删除) 时写日志, 返回 false.
+/// 跟着光标的是目标的系统图标 (图片是缩略图), 放到资源管理器等上方时显示"复制到 xxx", 和资源管理器里拖文件一样.
+pub fn drag_out(hwnd: HWND, target: &Path) -> bool {
+    let Some(data) = data_object(target) else {
+        return false;
+    };
+    set_drag_image(&data, target);
+    match unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY | DROPEFFECT_LINK) } {
+        Ok(effect) => effect != DROPEFFECT_NONE,
+        Err(e) => {
+            log::warn!("拖出 {} 失败: {e}", target.display());
+            false
+        }
+    }
+}
+
+/// 把文件或文件夹放进剪贴板, 在资源管理器, 微信里粘贴就是这个文件. 放好后交给系统保管, QRun 退出也还在.
+pub fn copy_file(target: &Path) -> bool {
+    let Some(data) = data_object(target) else {
+        return false;
+    };
+    unsafe { OleSetClipboard(&data).and_then(|_| OleFlushClipboard()) }
+        .inspect_err(|e| log::warn!("复制 {} 失败: {e}", target.display()))
+        .is_ok()
+}
+
+/// 给拖放数据挂上拖动图像; 取不到图标时写日志, 由系统用默认样子拖.
+fn set_drag_image(data: &IDataObject, target: &Path) {
+    let size = PARAMS.panel.drag_image_size;
+    let path = wide(target);
+    let result: windows::core::Result<()> = unsafe {
+        let helper: IDragSourceHelper2 =
+            CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).expect("create DragDropHelper");
+        // 允许放置目标在图标下方显示"复制到 xxx"这类说明
+        helper.SetFlags(DSH_ALLOWDROPDESCRIPTIONTEXT.0 as u32).expect("set drag helper flags");
+        SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(path.as_ptr()), None)
+            .and_then(|factory| factory.GetImage(SIZE { cx: size, cy: size }, SIIGBF_BIGGERSIZEOK))
+            .and_then(|bitmap| {
+                let mut info = BITMAP::default();
+                GetObjectW(HGDIOBJ(bitmap.0), size_of::<BITMAP>() as i32, Some(&mut info as *mut _ as *mut _));
+                let image = SHDRAGIMAGE {
+                    sizeDragImage: SIZE { cx: info.bmWidth, cy: info.bmHeight },
+                    // 光标在图标中间
+                    ptOffset: POINT { x: info.bmWidth / 2, y: info.bmHeight / 2 },
+                    hbmpDragImage: bitmap,
+                    // CLR_NONE: 不按颜色抠图, 用位图自带的透明度
+                    crColorKey: COLORREF(u32::MAX),
+                };
+                // 成功后位图归系统, 失败要自己释放
+                helper.InitializeFromBitmap(&image, data).inspect_err(|_| {
+                    let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                })
+            })
+    };
+    if let Err(e) = result {
+        log::warn!("取 {} 的拖动图像失败: {e}", target.display());
+    }
+}
+
+/// 资源管理器给文件用的数据对象 (带文件列表等格式), 拖放和剪贴板都认.
+fn data_object(target: &Path) -> Option<IDataObject> {
+    let path = wide(target);
+    let result: windows::core::Result<IDataObject> = unsafe {
+        SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(path.as_ptr()), None)
+            .and_then(|item| item.BindToHandler(None, &BHID_DataObject))
+    };
+    result.inspect_err(|e| log::warn!("读取 {} 失败: {e}", target.display())).ok()
 }
 
 /// ShellExecute 解析快捷方式和拉起进程可能要一两秒, 放到后台线程, 界面不跟着卡.

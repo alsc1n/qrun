@@ -14,7 +14,8 @@ use crate::ui::truncated::truncated_text;
 /// 列表行里的图标尺寸.
 const ICON_SIZE: f32 = 20.;
 
-pub fn open(library: &Entity<Library>, group: Id, window: &mut Window, cx: &mut App) {
+/// by_name 是设置"按名称去重", 加到分组时用.
+pub fn open(library: &Entity<Library>, group: Id, by_name: bool, window: &mut Window, cx: &mut App) {
     let delegate = AppList {
         apps: shell::installed_apps(),
         matched: Vec::new(),
@@ -22,6 +23,7 @@ pub fn open(library: &Entity<Library>, group: Id, window: &mut Window, cx: &mut 
         icons: HashMap::new(),
         library: library.clone(),
         group,
+        by_name,
     };
     let list = cx.new(|cx| {
         let mut list = ListState::new(delegate, window, cx).searchable(true);
@@ -44,6 +46,7 @@ struct AppList {
     icons: HashMap<usize, Option<Arc<RenderImage>>>,
     library: Entity<Library>,
     group: Id,
+    by_name: bool,
 }
 
 impl ListDelegate for AppList {
@@ -84,8 +87,8 @@ impl ListDelegate for AppList {
             return;
         };
         let app = &self.apps[self.matched[ix.row]];
-        let (name, target, group) = (app.name.clone(), app.target.clone(), self.group);
-        self.library.update(cx, |lib, cx| lib.add_app(group, name, target, cx));
+        let (name, target, group, by_name) = (app.name.clone(), app.target.clone(), self.group, self.by_name);
+        self.library.update(cx, |lib, cx| lib.add_app(group, name, target, by_name, cx));
         window.close_dialog(cx);
     }
 }

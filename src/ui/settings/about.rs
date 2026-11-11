@@ -32,10 +32,7 @@ pub fn page(settings: &Entity<Settings>, updater: &Entity<Updater>, cx: &App) ->
                         },
                     ),
                 )
-                .description(format!(
-                    "启动时和之后每 {} 小时检查一次, 有新版本时托盘提醒.",
-                    PARAMS.update.check_interval_hours
-                )),
+                .description(format!("每 {} 小时检查一次, 发现新版本时通知.", PARAMS.update.check_interval_hours)),
             )
             .item(SettingItem::new(
                 "开源地址",
@@ -93,7 +90,7 @@ fn update_item(settings: &Entity<Settings>, updater: &Entity<Updater>, cx: &App)
         Status::Verifying => "正在校验安装包...".into(),
         Status::Installing => "正在安装, QRun 即将重启...".into(),
         Status::Failed(e) => format!("更新失败: {e}"),
-        _ if skipped => format!("发现新版本 v{} (已跳过, 不再自动提醒).", release.version),
+        _ if skipped => format!("发现新版本 v{} (已跳过).", release.version),
         _ => format!("发现新版本 v{}.", release.version),
     };
     let field = match &state.status {

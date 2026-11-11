@@ -19,9 +19,16 @@ fn main() {
         log::error!("{info}");
         platform::error_box(&format!("QRun 出错, 即将退出. 请把下面的内容反馈给开发者:\n\n{info}"))
     }));
-    // 只开一个: 已在运行就让它显示面板, 自己退出. 要在开日志前判断, 否则会去改名正在运行的那个开着的 qrun.log
-    if !platform::first_instance() {
+    // 只开一个: 已在运行就让它显示面板, 自己退出. 要在开日志前判断, 否则会去改名正在运行的那个开着的 qrun.log.
+    // 重启 (如更改数据目录后) 时旧的正在退出, 等它退完
+    let restarting = std::env::args().any(|arg| arg == platform::install::RESTART_ARG);
+    if !(platform::first_instance() || restarting && platform::wait_first_instance()) {
         platform::tray::notify_running();
+        return;
+    }
+    // 定下数据目录 (安装版可能要先搬数据), 日志也写在那里
+    if let Err(message) = storage::prepare() {
+        platform::error_box(&message);
         return;
     }
     logger::init();

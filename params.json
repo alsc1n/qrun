@@ -8,7 +8,80 @@
     "timeout_secs": 20
   },
   "panel": {
-    "hover_switch_delay_ms": 150
+    "hover_switch_delay_ms": 150,
+    "drag_image_size": 96
+  },
+  "predict": {
+    "half_life_days": [3, 7, 14, 30, 90],
+    "hour_sigma": [0.7, 1.5],
+    "smoothing": 2.0,
+    "prior_count": 0.1,
+    "session_gap_minutes": 30,
+    "dedupe_seconds": 10,
+    "folder_merge_seconds": 10,
+    "replay_days": 90,
+    "replay_top_k": 5,
+    "replay_interval_hours": 24
+  },
+  "learn": {
+    "rate": 0.1,
+    "l2": 0.02,
+    "jev_initial": 2.0,
+    "jev_floor": 1.0,
+    "evidence_floor": 0.0,
+    "jev_smoothing": 0.05,
+    "initial": {
+      "in_title": 1.0,
+      "fresh": 6.0,
+      "modified": 1.0,
+      "focused": 0.3,
+      "started": 0.5,
+      "nearby": 1.0,
+      "after_events": 2.0
+    },
+    "skip_window": 5,
+    "skip_decay": 0.7,
+    "elsewhere_skipped": 3,
+    "hit_rate_days": 30,
+    "skip_days": 7,
+    "new_file_days": 3,
+    "open_merge_seconds": 2,
+    "keep_order_minutes": 5
+  },
+  "jev": {
+    "base_url": "https://api.typesafe.ai/v1",
+    "model": "jev-latest",
+    "timeout_secs": 10,
+    "max_candidates": 255,
+    "max_state_bytes": 30000,
+    "history": 40,
+    "prefetch_delay_ms": 1500,
+    "refresh_minutes": 5,
+    "prefetch_min_interval_seconds": 30,
+    "idle_minutes": 3,
+    "stale_minutes": 5,
+    "reorder_window_ms": 300,
+    "search_debounce_ms": 500,
+    "search_min_probability": 0.1
+  },
+  "timeline": {
+    "keep_minutes": 120,
+    "max_events": 5000,
+    "save_minutes": 5,
+    "summary_events": 15,
+    "focus_min_seconds": 2,
+    "merge_seconds": 2,
+    "file_merge_minutes": 5,
+    "process_interval_seconds": 2,
+    "port_interval_seconds": 10,
+    "burst_window_seconds": 10,
+    "burst_events": 20,
+    "activity_half_life_minutes": 30,
+    "candidates": 30,
+    "nearby_paths": 50,
+    "token_minutes": 10,
+    "cooccur_half_life_days": 30,
+    "jev_events": 20
   },
   "installer_app_id": "{98983307-BC2C-4CD7-BBFD-3CC28C3F50A5}"
 }

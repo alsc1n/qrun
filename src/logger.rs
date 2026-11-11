@@ -1,4 +1,4 @@
-//! 运行日志: exe 旁的 qrun.log, 记 warn / error (含 GPUI 内部经 `log` 报的错) 和崩溃信息.
+//! 运行日志: 数据目录里的 qrun.log, 记 warn / error (含 GPUI 内部经 `log` 报的错) 和崩溃信息.
 //! 每次启动把上次的日志改名为 qrun.log.old 再新开, 崩溃后重启一次仍能看到崩溃那次的日志, 文件也不会越积越大.
 
 use std::fs::{self, File};
@@ -9,7 +9,7 @@ use log::{LevelFilter, Log, Metadata, Record};
 
 use crate::{platform, storage};
 
-const FILE: &str = "qrun.log";
+pub const FILE: &str = "qrun.log";
 
 /// 不带缓冲直接写文件: 发布版 panic 后进程立即结束, 缓冲里的内容来不及写出.
 struct FileLogger(Mutex<File>);

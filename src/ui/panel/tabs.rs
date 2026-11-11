@@ -10,7 +10,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use super::{DraggedGroup, DraggedItem, Panel};
-use crate::model::library::Id;
+use crate::model::library::{GroupSort, Id};
 use crate::params::PARAMS;
 use crate::ui::truncated::truncated_text;
 
@@ -31,38 +31,34 @@ impl Panel {
         } else {
             h_flex().id("tabs").px_4().pb_3().gap_2().flex_wrap()
         };
+        // 推荐页固定在最前面, 只读: 不能拖动, 不接收拖来的项目, 没有右键菜单; 设置里关掉推荐时不显示
+        let smart = self.settings.read(cx).smart.enabled.then(|| {
+            tab(div().id("smart"), self.smart_page, vertical, cx)
+                .child("推荐")
+                .on_click(cx.listener(|this, _, _, cx| this.select_tab(None, cx)))
+                .when(hover_switch, |el| {
+                    el.on_hover(cx.listener(|this, hovered: &bool, _, cx| this.hover_tab(None, *hovered, cx)))
+                })
+        });
         // 标签, 重命名输入框, 新建按钮都是 32px 高 (控件默认 medium), 一排对齐
         container
+            .children(smart)
             .children(groups.iter().enumerate().map(|(ix, group)| {
                 let id = group.id;
                 if self.renaming == Some(id) {
                     return Input::new(&self.rename).when(!vertical, |el| el.w(px(120.))).into_any_element();
                 }
-                let (rename_entity, remove_entity) = (entity.clone(), entity.clone());
+                let (rename_entity, sort_entity, remove_entity) = (entity.clone(), entity.clone(), entity.clone());
+                let by_clicks = group.sort == GroupSort::Clicks;
                 let prev = ix.checked_sub(1).map(|ix| groups[ix].id);
                 let next = groups.get(ix + 1).map(|group| group.id);
-                div()
-                    .id(("group", id))
-                    .px_4()
-                    .py_1p5()
-                    .map(|el| if vertical { el.w_full().rounded_md() } else { el.rounded_full() })
-                    .text_sm()
-                    .cursor_pointer()
-                    .map(|el| {
-                        if id == self.active_group {
-                            el.bg(theme.secondary).text_color(theme.foreground)
-                        } else {
-                            el.text_color(theme.muted_foreground).hover(|s| s.bg(theme.list_hover))
-                        }
-                    })
-                    .map(|el| if vertical { el.truncate() } else { el })
+                tab(div().id(("group", id)), self.current_tab() == Some(id), vertical, cx)
                     .child(truncated_text("name", group.name.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active_group = id;
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_tab(Some(id), cx)))
                     .when(hover_switch, |el| {
-                        el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_group(id, *hovered, cx)))
+                        el.on_hover(
+                            cx.listener(move |this, hovered: &bool, _, cx| this.hover_tab(Some(id), *hovered, cx)),
+                        )
                     })
                     .on_drag(DraggedGroup { id, name: group.name.clone().into() }, |drag, _, _, cx| {
                         cx.new(|_| drag.clone())
@@ -70,20 +66,41 @@ impl Panel {
                     .on_drag_move(Self::track_drop::<DraggedGroup>(id, prev, next, vertical, gap, cx))
                     // 项目拖到标签上立即切到该分组, 可以接着拖进网格放到想要的位置
                     .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DraggedItem>, _, cx| {
-                        if this.active_group != id && event.bounds.contains(&event.event.position) {
-                            this.active_group = id;
-                            cx.notify();
+                        if this.current_tab() != Some(id) && event.bounds.contains(&event.event.position) {
+                            this.select_tab(Some(id), cx);
                         }
                     }))
-                    // 直接在标签上松手, 移到该分组末尾
+                    // 从外面拖进来的文件同样: 经过标签就切过去, 接着拖进网格放下
+                    .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                        if this.current_tab() != Some(id) && event.bounds.contains(&event.event.position) {
+                            this.select_tab(Some(id), cx);
+                        }
+                    }))
+                    // 直接在标签上松手, 移到 (或加到) 该分组末尾
                     .drag_over::<DraggedItem>(move |s, _, _, _| s.bg(drop_target))
                     .on_drop(cx.listener(move |this, drag: &DraggedItem, _, cx| {
                         this.library.update(cx, |lib, cx| lib.move_item(drag.id, id, None, cx));
                     }))
+                    .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(drop_target))
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                        if this.own_drop() {
+                            return;
+                        }
+                        this.add_paths(id, paths.paths(), cx);
+                    }))
                     .context_menu(move |menu, _, _| {
-                        let (rename_entity, remove_entity) = (rename_entity.clone(), remove_entity.clone());
+                        let (rename_entity, sort_entity, remove_entity) =
+                            (rename_entity.clone(), sort_entity.clone(), remove_entity.clone());
                         menu.item(PopupMenuItem::new("重命名").on_click(move |_, window, cx| {
                             rename_entity.update(cx, |this, cx| this.start_rename(id, window, cx)).ok();
+                        }))
+                        .item(PopupMenuItem::new("按点击次数排序").checked(by_clicks).on_click(move |_, _, cx| {
+                            let sort = if by_clicks { GroupSort::Manual } else { GroupSort::Clicks };
+                            sort_entity
+                                .update(cx, |this, cx| {
+                                    this.library.update(cx, |lib, cx| lib.set_group_sort(id, sort, cx))
+                                })
+                                .ok();
                         }))
                         .when(can_remove, |menu| {
                             menu.item(PopupMenuItem::new("删除分组").on_click(move |_, _, cx| {
@@ -98,7 +115,7 @@ impl Panel {
             .child(Button::new("add-group").ghost().icon(IconName::Plus).on_click(cx.listener(
                 |this, _, window, cx| {
                     let id = this.library.update(cx, |lib, cx| lib.add_group("新分组", cx));
-                    this.active_group = id;
+                    this.select_tab(Some(id), cx);
                     this.start_rename(id, window, cx);
                 },
             )))
@@ -116,28 +133,27 @@ impl Panel {
     }
 
     /// 鼠标在标签上停够 hover_switch_delay_ms 才切过去; 中途移开就取消, 划过标签栏不会连着切.
-    /// 进入下一个标签和离开上一个的事件先后不定, 所以离开时只取消自己那次.
-    fn hover_group(&mut self, id: Id, hovered: bool, cx: &mut Context<Self>) {
+    /// 进入下一个标签和离开上一个的事件先后不定, 所以离开时只取消自己那次. tab 为 None 是推荐页.
+    fn hover_tab(&mut self, tab: Option<Id>, hovered: bool, cx: &mut Context<Self>) {
         if !hovered {
-            if self.hover_switch.as_ref().is_some_and(|(pending, _)| *pending == id) {
+            if self.hover_switch.as_ref().is_some_and(|(pending, _)| *pending == tab) {
                 self.hover_switch = None;
             }
             return;
         }
-        if id == self.active_group {
+        if tab == self.current_tab() {
             return;
         }
         let delay = Duration::from_millis(PARAMS.panel.hover_switch_delay_ms);
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             this.update(cx, |this, cx| {
-                this.active_group = id;
                 this.hover_switch = None;
-                cx.notify();
+                this.select_tab(tab, cx);
             })
             .ok();
         });
-        self.hover_switch = Some((id, task));
+        self.hover_switch = Some((tab, task));
     }
 
     fn start_rename(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
@@ -177,4 +193,21 @@ impl Panel {
         }
         cx.notify();
     }
+}
+
+/// 标签的外观, 推荐页和分组共用: 竖排占满宽度并截断, 横排圆角胶囊.
+fn tab(el: Stateful<Div>, selected: bool, vertical: bool, cx: &App) -> Stateful<Div> {
+    let theme = cx.theme();
+    el.px_4()
+        .py_1p5()
+        .map(|el| if vertical { el.w_full().rounded_md().truncate() } else { el.rounded_full() })
+        .text_sm()
+        .cursor_pointer()
+        .map(|el| {
+            if selected {
+                el.bg(theme.secondary).text_color(theme.foreground)
+            } else {
+                el.text_color(theme.muted_foreground).hover(|s| s.bg(theme.list_hover))
+            }
+        })
 }

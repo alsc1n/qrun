@@ -2,11 +2,12 @@
 
 use std::ffi::c_void;
 
-use gpui_kit::{Hsla, Rgba, Window};
+use gpui_kit::{Hsla, Rgba, Window, WindowAppearance};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_CLOAK, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWA_CLOAK, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -59,14 +60,36 @@ pub fn remove_caption_buttons(hwnd: HWND) {
     }
 }
 
-/// 窗口底色跟着界面背景色: 颜色变了 (首次, 换主题) 才重新设置, last 记着上次设的颜色. 在视图的 render 里调用.
+/// 上次设的窗口底色和当时的系统深浅色, 见 `sync_backdrop`.
+pub type Backdrop = Option<(Hsla, WindowAppearance)>;
+
+/// 窗口底色跟着界面背景色: 颜色变了 (首次, 换主题) 才重新设置, last 记着上次设的. 在视图的 render 里调用.
 /// GPUI 的画面总比窗口位置, 大小的变化晚一帧, 这一帧里新露出的区域没有内容 (透明), 拖动窗口时像多了一层.
 /// 让系统先用界面背景色填满窗口, 露出来的也是同一个颜色, 就看不出来.
-pub fn sync_backdrop(last: &mut Option<Hsla>, window: &Window, color: Hsla) {
-    if *last != Some(color) {
-        set_backdrop_color(hwnd(window), color.into());
-        *last = Some(color);
+/// 底色连标题栏也铺上了, 所以标题栏的深浅色 (关闭按钮等的颜色) 也要跟界面背景走: GPUI 按系统深浅色设,
+/// 系统深色而界面浅色时是白色按钮配浅色底, 看不见. GPUI 在系统切换深浅色时会重设, 所以系统深浅色变了也要再设一次.
+pub fn sync_backdrop(last: &mut Backdrop, window: &Window, color: Hsla) {
+    let now = (color, window.appearance());
+    if *last != Some(now) {
+        let hwnd = hwnd(window);
+        set_backdrop_color(hwnd, color.into());
+        set_dark_caption(hwnd, color.l < 0.5);
+        *last = Some(now);
     }
+}
+
+/// 标题栏按深色或浅色画.
+fn set_dark_caption(hwnd: HWND, dark: bool) {
+    let value = BOOL::from(dark);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &value as *const BOOL as *const _,
+            size_of::<BOOL>() as u32,
+        )
+    }
+    .expect("set caption dark mode");
 }
 
 /// 让系统用纯色画窗口底层 (ACCENT_ENABLE_GRADIENT), 随窗口位置和大小同步, 不等 GPUI 下一帧.

@@ -1,22 +1,24 @@
-//! 常规: 开机自启, 单击或双击启动, 悬停切换分组, 置于顶层, 启动项目后收起面板.
+//! 常规: 开机自启, 单击或双击启动, 悬停切换分组, 置于顶层, 启动项目后收起面板, 按名称去重, 拖出程序时给什么.
 
 use gpui_kit::component::IconName;
 use gpui_kit::component::setting::{SettingField, SettingGroup, SettingItem, SettingPage};
 use gpui_kit::*;
 
 use super::handle;
-use crate::model::settings::{LaunchClick, Settings};
+use crate::model::settings::{DragProgram, LaunchClick, Settings};
 use crate::platform::autostart::{self, Autostart};
 
 pub fn page(settings: &Entity<Settings>) -> SettingPage {
     let autostart_description = match autostart::state() {
-        Autostart::Moved => "位置已移动, 请重新开启.",
-        _ => "登录 Windows 后自动运行 QRun.",
+        Autostart::Moved => "启动项已失效, 请重新开启.",
+        _ => "登录 Windows 时启动 QRun.",
     };
     let (read, write) = handle(settings);
     let (click_read, click_write) = handle(settings);
     let (hover_read, hover_write) = handle(settings);
     let (top_read, top_write) = handle(settings);
+    let (dedupe_read, dedupe_write) = handle(settings);
+    let (drag_read, drag_write) = handle(settings);
 
     SettingPage::new("常规").icon(IconName::Settings2).default_open(true).group(
         SettingGroup::new()
@@ -58,7 +60,7 @@ pub fn page(settings: &Entity<Settings>) -> SettingPage {
                         },
                     ),
                 )
-                .description("鼠标停在分组标签上就切过去, 不用点击."),
+                .description("鼠标悬停在分组标签上时切换分组."),
             )
             .item(
                 SettingItem::new(
@@ -70,7 +72,7 @@ pub fn page(settings: &Entity<Settings>) -> SettingPage {
                         },
                     ),
                 )
-                .description("面板始终在其他窗口上方; 贴边时总是置顶."),
+                .description("面板始终显示在其他窗口之上."),
             )
             .item(
                 SettingItem::new(
@@ -82,7 +84,36 @@ pub fn page(settings: &Entity<Settings>) -> SettingPage {
                         },
                     ),
                 )
-                .description("贴边状态下不收起, 鼠标离开后它会自己缩回."),
+                .description("贴边时除外."),
+            )
+            .item(
+                SettingItem::new(
+                    "按名称去重",
+                    SettingField::switch(
+                        move |cx| dedupe_read.read(cx).general.dedupe_names,
+                        move |value, cx| {
+                            dedupe_write.update(cx, |s, cx| s.change(cx, |s| s.general.dedupe_names = value))
+                        },
+                    ),
+                )
+                .description("分组中已有同名项目时不再添加. 目标相同的项目始终不重复添加."),
+            )
+            .item(
+                SettingItem::new(
+                    "拖出程序",
+                    SettingField::dropdown(
+                        vec![("shortcut".into(), "快捷方式".into()), ("file".into(), "程序本身".into())],
+                        move |cx| match drag_read.read(cx).general.drag_program {
+                            DragProgram::Shortcut => "shortcut".into(),
+                            DragProgram::File => "file".into(),
+                        },
+                        move |value, cx| {
+                            let drag = if value == "file" { DragProgram::File } else { DragProgram::Shortcut };
+                            drag_write.update(cx, |s, cx| s.change(cx, |s| s.general.drag_program = drag));
+                        },
+                    ),
+                )
+                .description("把程序拖到其他位置时生成的内容. 快捷方式拖出后仍是快捷方式."),
             ),
     )
 }

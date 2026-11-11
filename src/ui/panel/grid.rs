@@ -9,25 +9,25 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use super::{DraggedItem, LinkDrop, Panel};
-use crate::model::library::{Id, Item, Library};
+use crate::model::library::{GroupSort, Id, Item, Library, Via};
 use crate::model::settings::LaunchClick;
 use crate::platform::shell;
 use crate::ui::truncated::truncated_text;
 use crate::ui::{app_picker, item_editor};
 
 /// 项目格子之间的间距 (行列相同).
-const GAP: Pixels = px(4.);
+pub(super) const GAP: Pixels = px(4.);
 /// 项目宽度 = 图标尺寸 + 这个余量 (给名称和内边距).
-const ITEM_PADDING: Pixels = px(44.);
+pub(super) const ITEM_PADDING: Pixels = px(44.);
 
 /// 这么宽的网格一行放几个项目, 至少一个.
-fn columns(width: Pixels, item_width: Pixels) -> u16 {
+pub(super) fn columns(width: Pixels, item_width: Pixels) -> u16 {
     ((width + GAP) / (item_width + GAP)).floor().max(1.) as u16
 }
 
 impl Panel {
     /// 记下网格宽度; 只有列数变了才重画, 拖窗口改大小时不多画一遍.
-    fn set_grid_width(&mut self, width: Pixels, item_width: Pixels, cx: &mut Context<Self>) {
+    pub(super) fn set_grid_width(&mut self, width: Pixels, item_width: Pixels, cx: &mut Context<Self>) {
         let changed = columns(width, item_width) != columns(self.grid_width, item_width);
         self.grid_width = width;
         if changed {
@@ -36,7 +36,10 @@ impl Panel {
     }
 
     pub(super) fn render_grid(&mut self, searching: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.visible_items(cx);
+        let (items, extras) = self.visible(cx);
+        // 按点击次数排序的分组顺序不由拖拽决定, 不显示插入线, 项目只能拖到标签上换分组
+        let sortable =
+            !searching && self.library.read(cx).group(self.active_group).is_some_and(|g| g.sort == GroupSort::Manual);
         // 列数按上一帧量到的网格宽度算; 放不下下一个项目前列数不变, 多出的宽度平分给各列, 项目在格子里居中
         let item_width = px(self.settings.read(cx).appearance.icon_size) + ITEM_PADDING;
         let columns = columns(self.grid_width, item_width);
@@ -44,7 +47,7 @@ impl Panel {
         let theme = cx.theme();
         let (muted_fg, accent) = (theme.muted_foreground, theme.accent);
 
-        let body = if items.is_empty() {
+        let body = if items.is_empty() && extras.is_empty() {
             div()
                 .size_full()
                 .flex()
@@ -67,7 +70,18 @@ impl Panel {
                 .children(items.iter().enumerate().map(|(ix, item)| {
                     let prev = ix.checked_sub(1).map(|ix| items[ix].id);
                     let next = items.get(ix + 1).map(|item| item.id);
-                    self.render_item(item, prev, next, searching, cx)
+                    self.render_item(item, prev, next, searching, sortable, cx)
+                }))
+                // Jev 按搜索词认为很可能的其他候选, 只读, 点开即启动
+                .children(extras.into_iter().enumerate().map(|(ix, ranked)| {
+                    let tile = self.tile(("extra", ix), &ranked.name, &ranked.target, cx).on_click(cx.listener(
+                        move |this, event: &ClickEvent, _, cx| {
+                            if this.launches_on(event, cx) {
+                                this.launch_ranked(&ranked, Via::Search, cx);
+                            }
+                        },
+                    ));
+                    div().flex().justify_center().child(tile)
                 }))
                 // 量网格宽度, 变了就重排
                 .child(
@@ -92,11 +106,13 @@ impl Panel {
             .rounded_lg()
             .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(accent.opacity(0.25)))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                let group = this.active_group;
-                this.library.update(cx, |lib, cx| lib.add_paths(group, paths.paths(), cx));
+                if this.own_drop() {
+                    return;
+                }
+                this.add_paths(this.active_group, paths.paths(), cx);
             }))
             // 光标在网格空白处时插到末尾 (最后一个项目后侧亮线); 在项目上时由项目改成精确位置
-            .on_drag_move(Self::track_drop_tail::<DraggedItem>(cx))
+            .when(sortable, |el| el.on_drag_move(Self::track_drop_tail::<DraggedItem>(cx)))
             // 松手按插入线的位置放; 没有插入线 (位置不变) 时不动
             .on_drop(cx.listener(|this, drag: &DraggedItem, _, cx| {
                 let Some(hint) = this.drop_hint.take() else {
@@ -114,8 +130,10 @@ impl Panel {
                 move |menu, _, _| {
                     let (library, panel) = (library.clone(), panel.clone());
                     menu.item(PopupMenuItem::new("添加应用…").on_click(move |_, window, cx| {
-                        if let Ok(group) = panel.read_with(cx, |this, _| this.active_group) {
-                            app_picker::open(&library, group, window, cx);
+                        if let Ok((group, by_name)) =
+                            panel.read_with(cx, |this, cx| (this.active_group, this.dedupe_names(cx)))
+                        {
+                            app_picker::open(&library, group, by_name, window, cx);
                         }
                     }))
                 }
@@ -133,7 +151,7 @@ impl Panel {
         cx: &mut Context<Self>,
     ) {
         let link = match event.drag(cx).paths() {
-            [path] if shell::is_link(path) => Some(path.clone()),
+            [path] if shell::is_link(path) && !self.in_system_drag() => Some(path.clone()),
             _ => None,
         };
         if self.link_drop.as_ref().map(|drop| &drop.link) != link.as_ref() {
@@ -154,8 +172,7 @@ impl Panel {
         let keep = link_zone("keep-link", "保留快捷方式", file_name(&drop.link), blue, muted_fg).on_drop(cx.listener(
             |this, paths: &ExternalPaths, _, cx| {
                 this.link_drop = None;
-                let group = this.active_group;
-                this.library.update(cx, |lib, cx| lib.add_paths(group, paths.paths(), cx));
+                this.add_paths(this.active_group, paths.paths(), cx);
             },
         ));
         let resolve = drop.shortcut.as_ref().map(|shortcut| {
@@ -163,9 +180,9 @@ impl Panel {
             link_zone("resolve-link", "解析为目标程序", file_name(&target), green, muted_fg).on_drop(cx.listener(
                 move |this, _: &ExternalPaths, _, cx| {
                     this.link_drop = None;
-                    let group = this.active_group;
+                    let (group, by_name) = (this.active_group, this.dedupe_names(cx));
                     let (target, args) = (target.clone(), args.clone());
-                    this.library.update(cx, |lib, cx| lib.add_link_target(group, &link, target, args, cx));
+                    this.library.update(cx, |lib, cx| lib.add_link_target(group, &link, target, args, by_name, cx));
                 },
             ))
         });
@@ -186,16 +203,49 @@ impl Panel {
     }
 
     /// prev / next 是前后相邻的项目. 搜索结果混着多个分组, 排序没有意义, 搜索时不能拖动.
+    /// sortable 为 false 时能拖但不显示插入线, 只能拖到标签上换分组.
     fn render_item(
         &mut self,
         item: &Item,
         prev: Option<Id>,
         next: Option<Id>,
         searching: bool,
+        sortable: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let id = item.id;
+        let drag = DraggedItem { id, name: item.name.clone().into(), target: item.target.clone() };
+        // 拖动判定挂在格子上: 格子间距固定为 GAP, 插入线落在两个格子正中, 也就是两个项目正中
+        let track = Self::track_drop::<DraggedItem>(id, prev, next, false, GAP, cx);
+        let launch_item = item.clone();
+        let menu_item = item.clone();
+        let library = self.library.clone();
+        let panel = cx.entity().downgrade();
+        let tile = self
+            .tile(("item", id), &item.name, &item.target, cx)
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if this.launches_on(event, cx) {
+                    let via = this.grid_via(cx);
+                    this.launch(&launch_item, false, via, cx);
+                }
+            }))
+            .when(!searching, |el| el.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())))
+            .context_menu(move |menu, _, _| item_menu(menu, &menu_item, &library, &panel));
+
+        // 格子占满一列, 项目在里面居中
+        div().flex().justify_center().when(sortable, |el| el.on_drag_move(track)).child(tile)
+    }
+
+    /// 一个项目格: 图标加名称, 悬停和按下的样式; 点击, 拖动, 右键由调用方加. 网格和推荐页共用.
+    pub(super) fn tile(
+        &mut self,
+        id: impl Into<ElementId>,
+        name: &str,
+        target: &Path,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let icon_size = px(self.settings.read(cx).appearance.icon_size);
-        let icon = self.icon(&item.target, cx);
+        let icon = self.icon(target, cx);
         let theme = cx.theme();
 
         let icon = match icon {
@@ -209,20 +259,12 @@ impl Panel {
                 .items_center()
                 .justify_center()
                 .text_color(theme.muted_foreground)
-                .child(item.name.chars().next().unwrap_or(' ').to_string())
+                .child(name.chars().next().unwrap_or(' ').to_string())
                 .into_any_element(),
         };
 
-        let id = item.id;
-        let drag = DraggedItem { id, name: item.name.clone().into() };
-        // 拖动判定挂在格子上: 格子间距固定为 GAP, 插入线落在两个格子正中, 也就是两个项目正中
-        let track = Self::track_drop::<DraggedItem>(id, prev, next, false, GAP, cx);
-        let launch_item = item.clone();
-        let menu_item = item.clone();
-        let library = self.library.clone();
-        let panel = cx.entity().downgrade();
-        let tile = v_flex()
-            .id(("item", item.id))
+        v_flex()
+            .id(id)
             .w(icon_size + ITEM_PADDING)
             .py_2()
             .px_1()
@@ -241,22 +283,17 @@ impl Panel {
                     .text_center()
                     .line_clamp(2)
                     .text_ellipsis()
-                    .child(truncated_text("name", item.name.clone())),
+                    .child(truncated_text("name", name.to_string())),
             )
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                let clicks = match this.settings.read(cx).general.launch_click {
-                    LaunchClick::Single => 1,
-                    LaunchClick::Double => 2,
-                };
-                if event.click_count() == clicks {
-                    this.launch(&launch_item, false, cx);
-                }
-            }))
-            .when(!searching, |el| el.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())))
-            .context_menu(move |menu, _, _| item_menu(menu, &menu_item, &library, &panel));
+    }
 
-        // 格子占满一列, 项目在里面居中
-        div().flex().justify_center().when(!searching, |el| el.on_drag_move(track)).child(tile)
+    /// 按设置里的单击或双击启动, 这次点击算不算启动.
+    pub(super) fn launches_on(&self, event: &ClickEvent, cx: &App) -> bool {
+        let clicks = match self.settings.read(cx).general.launch_click {
+            LaunchClick::Single => 1,
+            LaunchClick::Double => 2,
+        };
+        event.click_count() == clicks
     }
 }
 
@@ -291,11 +328,17 @@ fn file_name(path: &Path) -> String {
 /// 项目右键菜单. 编辑和删除按项目 ID 操作, 菜单打开期间别处增删项目也不会指错.
 fn item_menu(menu: PopupMenu, item: &Item, library: &Entity<Library>, panel: &WeakEntity<Panel>) -> PopupMenu {
     let id = item.id;
-    let (admin_item, with_target, reveal_target, copy_target) =
-        (item.clone(), item.target.clone(), item.target.clone(), item.target.clone());
-    let (edit_library, remove_library, panel) = (library.clone(), library.clone(), panel.clone());
+    let (admin_item, with_target, reveal_target, copy_target, file_target) =
+        (item.clone(), item.target.clone(), item.target.clone(), item.target.clone(), item.target.clone());
+    let (edit_library, remove_library, panel, copy_panel) =
+        (library.clone(), library.clone(), panel.clone(), panel.clone());
     menu.item(PopupMenuItem::new("以管理员身份运行").on_click(move |_, _, cx| {
-        panel.update(cx, |this, cx| this.launch(&admin_item, true, cx)).ok();
+        panel
+            .update(cx, |this, cx| {
+                let via = this.grid_via(cx);
+                this.launch(&admin_item, true, via, cx)
+            })
+            .ok();
     }))
     .item(PopupMenuItem::new("打开方式").on_click(move |_, _, _| shell::open_with(&with_target)))
     .item(PopupMenuItem::new("打开所在位置").on_click(move |_, _, _| shell::reveal(&reveal_target)))
@@ -304,6 +347,14 @@ fn item_menu(menu: PopupMenu, item: &Item, library: &Entity<Library>, panel: &We
             cx.write_to_clipboard(ClipboardItem::new_string(copy_target.display().to_string()))
         }),
     )
+    .item(PopupMenuItem::new("复制文件").on_click(move |_, _, cx| {
+        copy_panel
+            .update(cx, |this, cx| {
+                let via = this.grid_via(cx);
+                this.copy_file(Some(id), &file_target, via, cx)
+            })
+            .ok();
+    }))
     .separator()
     .item(PopupMenuItem::new("编辑").on_click(move |_, window, cx| item_editor::open(&edit_library, id, window, cx)))
     .item(PopupMenuItem::new("删除").on_click(move |_, _, cx| {

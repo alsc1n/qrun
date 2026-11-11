@@ -2,34 +2,45 @@
 
 mod about;
 mod appearance;
+mod data;
 mod dock;
 mod general;
+mod smart;
 
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::setting::{SettingField, Settings as SettingsLayout};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::*;
 
 use crate::app::update::Updater;
+use crate::model::library::Library;
 use crate::model::settings::Settings;
 use crate::platform::window;
 
 pub struct SettingsView {
     settings: Entity<Settings>,
+    /// 推荐页显示命中率.
+    library: Entity<Library>,
     updater: Entity<Updater>,
     /// 字体下拉要跨帧保留搜索词和展开状态, 由视图持有.
     font_select: appearance::FontSelect,
     /// 滑动条同样要跨帧保留拖动状态.
     icon_size: Entity<SliderState>,
     dock_sliders: dock::DockSliders,
+    smart_sliders: smart::SmartSliders,
+    rolan_import: data::Status,
+    data_location: data::Status,
+    data_dir: Entity<InputState>,
     /// 系统给窗口画的底色, 跟着界面背景色; 见 `window::sync_backdrop`.
-    backdrop: Option<Hsla>,
+    backdrop: window::Backdrop,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsView {
     pub fn new(
         settings: Entity<Settings>,
+        library: Entity<Library>,
         updater: Entity<Updater>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -37,9 +48,32 @@ impl SettingsView {
         let font_select = appearance::font_select(&settings, window, cx);
         let icon_size = appearance::icon_size_slider(&settings, cx);
         let dock_sliders = dock::sliders(&settings, cx);
-        let _subscriptions =
-            vec![cx.observe(&settings, |_, _, cx| cx.notify()), cx.observe(&updater, |_, _, cx| cx.notify())];
-        Self { settings, updater, font_select, icon_size, dock_sliders, backdrop: None, _subscriptions }
+        let smart_sliders = smart::sliders(&settings, cx);
+        let rolan_import = cx.new(|_| None);
+        let data_location = cx.new(|_| None);
+        let data_dir = data::location_input(&data_location, window, cx);
+        let _subscriptions = vec![
+            cx.observe(&settings, |_, _, cx| cx.notify()),
+            cx.observe(&updater, |_, _, cx| cx.notify()),
+            // 新的启动会改变推荐命中率
+            cx.observe(&library, |_, _, cx| cx.notify()),
+            cx.observe(&rolan_import, |_, _, cx| cx.notify()),
+            cx.observe(&data_location, |_, _, cx| cx.notify()),
+        ];
+        Self {
+            settings,
+            library,
+            updater,
+            font_select,
+            icon_size,
+            dock_sliders,
+            smart_sliders,
+            rolan_import,
+            data_location,
+            data_dir,
+            backdrop: None,
+            _subscriptions,
+        }
     }
 }
 
@@ -49,7 +83,9 @@ impl Render for SettingsView {
         SettingsLayout::new("settings").sidebar_width(px(180.)).pages([
             general::page(&self.settings),
             appearance::page(&self.settings, &self.font_select, &self.icon_size, cx),
+            smart::page(&self.settings, &self.library, &self.smart_sliders, cx),
             dock::page(&self.settings, &self.dock_sliders, cx),
+            data::page(&self.library, &self.rolan_import, &self.data_dir, &self.data_location, cx),
             about::page(&self.settings, &self.updater, cx),
         ])
     }

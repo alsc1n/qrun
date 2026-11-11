@@ -1,5 +1,5 @@
 ; QRun 安装包: 装到当前用户目录 (%LOCALAPPDATA%\Programs\QRun), 不要管理员权限;
-; 设置和数据照旧写在 exe 旁, 与绿色版同一套逻辑.
+; 设置和数据由 QRun 放到 %LOCALAPPDATA%\QRun (可在设置里改), 不在安装目录里. 卸载不删数据.
 ; 先 cargo build --release, 再编译: ISCC /DAppVersion=0.1.0 installer\qrun.iss
 
 #define AppName "QRun"
@@ -49,6 +49,8 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 [Registry]
 ; 开机自启由 QRun 自己写入 (platform/autostart.rs), 卸载时一并删掉, 不留失效的启动项.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "QRun"; Flags: uninsdeletevalue
+; QRun 自己的键 (自选的数据目录, platform/install.rs 的 APP_KEY), 卸载时整个删掉.
+Root: HKCU; Subkey: "Software\QRun"; Flags: uninsdeletekey
 
 [Run]
 ; 不加 skipifsilent: 应用内静默更新装完后要自动重新启动 QRun; 手动安装时仍是完成页的勾选项

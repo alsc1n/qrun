@@ -63,7 +63,7 @@ pub fn page(settings: &Entity<Settings>, sliders: &DockSliders, cx: &App) -> Set
                         move |value, cx| enabled_write.update(cx, |s, cx| s.change(cx, |s| s.dock.enabled = value)),
                     ),
                 )
-                .description("拖到屏幕上, 左, 右边松手即吸附, 鼠标离开后滑出屏幕."),
+                .description("将面板拖到屏幕边缘时贴靠, 鼠标移开后自动隐藏."),
             )
             .item(
                 SettingItem::new(
@@ -73,24 +73,16 @@ pub fn page(settings: &Entity<Settings>, sliders: &DockSliders, cx: &App) -> Set
                         move |value, cx| lock_write.update(cx, |s, cx| s.change(cx, |s| s.dock.lock_position = value)),
                     ),
                 )
-                .description("吸附后窗口拖不动, 再次启动 QRun 也不会解除吸附.")
+                .description("贴靠后不可拖动.")
                 .disabled(!enabled),
             )
             .item(
-                item("吸附距离", &sliders.snap_distance)
-                    .description(format!("松手时离屏幕边多近就吸附: {} 像素", value(&sliders.snap_distance))),
+                item("吸附距离", &sliders.snap_distance).description(format!("{} 像素", value(&sliders.snap_distance))),
             )
-            .item(
-                item("缩回延迟", &sliders.hide_delay)
-                    .description(format!("鼠标离开后多久缩回: {} 毫秒", value(&sliders.hide_delay))),
-            )
+            .item(item("缩回延迟", &sliders.hide_delay).description(format!("{} 毫秒", value(&sliders.hide_delay))))
             .item(item("动画时长", &sliders.animation).description({
                 let ms = value(&sliders.animation);
-                if ms == 0. {
-                    "滑出和缩回的时长: 0 毫秒, 不要动画".to_string()
-                } else {
-                    format!("滑出和缩回的时长: {ms} 毫秒")
-                }
+                if ms == 0. { "无动画".to_string() } else { format!("{ms} 毫秒") }
             })),
     )
 }

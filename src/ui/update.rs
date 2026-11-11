@@ -15,7 +15,7 @@ pub struct UpdateView {
     settings: Entity<Settings>,
     updater: Entity<Updater>,
     /// 系统给窗口画的底色, 跟着界面背景色; 见 `window::sync_backdrop`.
-    backdrop: Option<Hsla>,
+    backdrop: native::Backdrop,
     _subscriptions: Vec<Subscription>,
 }
 

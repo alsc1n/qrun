@@ -1,6 +1,7 @@
 //! 应用级: 打开窗口 (面板, 设置), 分发托盘命令和应用动作, 驱动贴边和定时检查更新.
 
 mod dock;
+mod sensors;
 pub mod update;
 
 use std::borrow::Cow;
@@ -15,12 +16,14 @@ use crate::actions::{OpenSettings, OpenUpdate};
 use crate::model::library::Library;
 use crate::model::settings::Settings;
 use crate::params::PARAMS;
+use crate::platform::shell;
 use crate::platform::tray::{self, Tray};
 use crate::platform::window as native;
 use crate::ui::panel::Panel;
 use crate::ui::settings::SettingsView;
 use crate::ui::update::UpdateView;
 use dock::Dock;
+use sensors::Sensors;
 use update::Updater;
 
 /// 轮询托盘命令和鼠标位置的间隔.
@@ -37,6 +40,8 @@ const MAX_SCREEN_RATIO: f32 = 0.9;
 /// 全局共享的数据, 各窗口都从这里拿同一份 Entity.
 struct Shared {
     settings: Entity<Settings>,
+    /// 设置页的推荐命中率从这里读.
+    library: Entity<Library>,
     updater: Entity<Updater>,
     /// 已打开的设置窗口; 再次打开时激活它而不是新开一个.
     settings_window: Option<AnyWindowHandle>,
@@ -49,10 +54,15 @@ impl Global for Shared {}
 pub fn run(settings: Settings, library: Library, cx: &mut App) {
     let saved = size(px(settings.window.width), px(settings.window.height));
     let settings = cx.new(|_| settings);
-    let library = cx.new(|_| library);
+    let library = cx.new(|cx| {
+        let mut library = library;
+        library.start_tuning(cx);
+        library
+    });
     let updater = cx.new(|_| Updater::new());
     cx.set_global(Shared {
         settings: settings.clone(),
+        library: library.clone(),
         updater: updater.clone(),
         settings_window: None,
         update_window: None,
@@ -71,6 +81,7 @@ pub fn run(settings: Settings, library: Library, cx: &mut App) {
         ..Default::default()
     };
     let panel_settings = settings.clone();
+    let panel_library = library.clone();
     let (window, panel) = gpui_kit::open_window(options, cx, |window, cx| {
         let hwnd = native::hwnd(window);
         native::hide_from_taskbar(hwnd);
@@ -79,12 +90,12 @@ pub fn run(settings: Settings, library: Library, cx: &mut App) {
         // 首次显示会用居中的初始位置, 隐身到 poll 里挪回贴边位置后再现身, 否则屏幕中间会闪一下
         native::set_cloaked(hwnd, true);
         window.activate_window();
-        cx.new(|cx| Panel::new(library, panel_settings, window, cx))
+        cx.new(|cx| Panel::new(panel_library, panel_settings, window, cx))
     })
     .expect("open panel window");
 
     let hwnd = panel.read(cx).hwnd;
-    poll(window, hwnd, settings, updater, cx);
+    poll(window, hwnd, panel, settings, library, updater, cx);
 }
 
 /// 注册 exe 旁 fonts 目录里随程序发布的字体 (默认的 HarmonyOS Sans SC), 只对 QRun 生效, 不装进系统.
@@ -139,7 +150,7 @@ fn open_settings(cx: &mut App) {
         return;
     }
     let shared = cx.global::<Shared>();
-    let (settings, updater) = (shared.settings.clone(), shared.updater.clone());
+    let (settings, library, updater) = (shared.settings.clone(), shared.library.clone(), shared.updater.clone());
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
@@ -150,9 +161,10 @@ fn open_settings(cx: &mut App) {
         titlebar: Some(TitlebarOptions { title: Some("设置".into()), ..Default::default() }),
         ..Default::default()
     };
-    let (handle, _) =
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| SettingsView::new(settings, updater, window, cx)))
-            .expect("open settings window");
+    let (handle, _) = gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(settings, library, updater, window, cx))
+    })
+    .expect("open settings window");
     cx.global_mut::<Shared>().settings_window = Some(handle);
 }
 
@@ -177,9 +189,18 @@ fn open_update(cx: &mut App) {
     cx.global_mut::<Shared>().update_window = Some(handle);
 }
 
-/// 托盘消息和贴边都只能从 Win32 读到, 没有 GPUI 事件可订阅, 所以定时轮询; 定时检查更新也挂在这里.
-fn poll(window: AnyWindowHandle, hwnd: HWND, settings: Entity<Settings>, updater: Entity<Updater>, cx: &mut App) {
+/// 托盘消息, 贴边和前台窗口都只能从 Win32 读到, 没有 GPUI 事件可订阅, 所以定时轮询; 定时检查更新和时间线采集也挂在这里.
+fn poll(
+    window: AnyWindowHandle,
+    hwnd: HWND,
+    panel: Entity<Panel>,
+    settings: Entity<Settings>,
+    library: Entity<Library>,
+    updater: Entity<Updater>,
+    cx: &mut App,
+) {
     let tray = Tray::new();
+    let mut sensors = Sensors::new();
     let mut dock = Dock::new(hwnd, settings.read(cx).dock, settings.read(cx).window.docked);
     let check_interval = Duration::from_secs(PARAMS.update.check_interval_hours * 3600);
     let mut next_check = Instant::now();
@@ -212,7 +233,9 @@ fn poll(window: AnyWindowHandle, hwnd: HWND, settings: Entity<Settings>, updater
                     }
                     window.update(cx, |_, window, _| window.activate_window()).ok();
                 }
+                // 退出 (托盘菜单, 自动更新装包前): 先把时间线写进库, 重启后接着用
                 Some(tray::Command::Quit) => {
+                    library.update(cx, |library, _| library.save_timeline());
                     tray.remove();
                     cx.update(|cx| cx.quit());
                 }
@@ -228,6 +251,20 @@ fn poll(window: AnyWindowHandle, hwnd: HWND, settings: Entity<Settings>, updater
                 native::set_topmost(hwnd, wanted);
                 topmost = wanted;
             }
+            // 面板从托盘显示或从边外滑出算打开一次; 顺带跟踪前台窗口给 Jev 预取
+            let presented = native::is_visible(hwnd) && !dock.is_hidden();
+            panel.update(cx, |panel, cx| panel.tick(presented, cx));
+            // 拖着项目或推荐页的格子出了面板: 交给系统拖放, 才能放进别的程序; 系统接管到松手才返回.
+            // 要在 update 之外调: 拖放期间系统照常给 GPUI 窗口发消息, 处理消息时要借用 App.
+            // 先收掉面板里跟着光标的名称框, 拖放期间只显示系统的拖动图像
+            if panel.read_with(cx, |panel, cx| panel.dragging(cx)) && dock::dragged_outside(hwnd) {
+                window.update(cx, |_, window, cx| cx.stop_active_drag(window)).ok();
+                let file = panel.update(cx, |panel, cx| panel.start_system_drag(cx));
+                let dropped = file.is_some_and(|file| shell::drag_out(hwnd, &file));
+                panel.update(cx, |panel, cx| panel.dragged_out(dropped, cx));
+            }
+            let recommend = settings.read_with(cx, |s, _| s.smart.enabled);
+            cx.update(|cx| sensors.tick(&library, recommend, cx));
 
             if settings.read_with(cx, |s, _| s.general.auto_check_updates) && Instant::now() >= next_check {
                 next_check = Instant::now() + check_interval;

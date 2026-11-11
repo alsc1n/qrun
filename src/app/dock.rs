@@ -77,6 +77,11 @@ impl Dock {
         shown_origin(edge, &rect, &window::monitor_rect(&rect))
     }
 
+    /// 缩在屏幕边外.
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
     /// 设置页改了参数后立即生效.
     pub fn set_settings(&mut self, settings: DockSettings) {
         self.settings = settings;
@@ -222,6 +227,11 @@ fn screen_beyond(edge: Edge, rect: &RECT, monitor: &RECT) -> bool {
         Edge::Right => POINT { x: monitor.right, y: mid_y },
     };
     !unsafe { MonitorFromPoint(outside, MONITOR_DEFAULTTONULL) }.is_invalid()
+}
+
+/// 按着鼠标左键且光标已在窗口 (含缩放边框) 外: 拖着东西出了面板.
+pub(super) fn dragged_outside(hwnd: HWND) -> bool {
+    mouse_down() && cursor().is_some_and(|point| !contains(&window::outer_rect(hwnd), point))
 }
 
 fn contains(rect: &RECT, point: POINT) -> bool {

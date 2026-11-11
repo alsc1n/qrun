@@ -1,13 +1,16 @@
 //! 主面板: 标题栏 (header), 分组标签 (tabs), 图标网格 (grid).
 
+mod drag_out;
 mod grid;
 mod header;
+mod jev;
+mod smart;
 mod tabs;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
@@ -15,16 +18,27 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use windows::Win32::Foundation::HWND;
 
-use crate::model::library::{Id, Item, Library};
+use crate::model::library::{Id, Item, Library, NEW_FILE, Observed, Ranked, Via};
 use crate::model::settings::{Settings, TabLayout};
+use crate::params::PARAMS;
+use crate::platform::recent::{self, Recent};
 use crate::platform::{shell, window as native};
 
 pub struct Panel {
     pub hwnd: HWND,
     library: Entity<Library>,
     settings: Entity<Settings>,
+    /// 当前是推荐页 (固定在分组标签最前面); 为 false 时显示 active_group.
+    smart_page: bool,
     active_group: Id,
+    /// 上次读到的系统最近记录, 推荐页显示用; 还没读完时为 None.
+    recent: Option<Recent>,
+    /// 后台读系统最近记录; 换成新任务时旧的随之取消.
+    read_recent: Task<()>,
     search: Entity<InputState>,
+    /// 搜索结果: 网格里的项目, 以及 Jev 认为很可能但名称不匹配的候选. 排序要给全部候选打分, 不在每次重画时算,
+    /// 只在搜索词, 库, 推荐开关或 Jev 结果变了时重算 (`refresh_search`); 没在搜索时为空.
+    searched: (Vec<Item>, Vec<Ranked>),
     /// 正在重命名的分组和它的输入框.
     renaming: Option<Id>,
     rename: Entity<InputState>,
@@ -39,17 +53,20 @@ pub struct Panel {
     /// 上一帧量到的网格宽度, 用来算一行放几列.
     grid_width: Pixels,
     /// 系统给窗口画的底色, 跟着界面背景色; 见 `window::sync_backdrop`.
-    backdrop: Option<Hsla>,
+    backdrop: native::Backdrop,
     /// 从外部拖入的单个快捷方式, 有值时内容区盖上左右分区; 拖动面板内元素时清掉.
     link_drop: Option<LinkDrop>,
+    /// 正在拖的项目或推荐页格子, 拖出窗口时交给系统 (见 `drag_out`); 不在拖时由 `tick` 清掉.
+    drag_out: Option<drag_out::DragOut>,
     /// 按目标路径缓存的图标; None 表示取不到 (目标已不存在).
     icons: HashMap<PathBuf, Option<Arc<RenderImage>>>,
     /// 等停手后保存窗口大小; 换成新任务时旧的随之取消.
     save_size: Task<()>,
     /// 等图标尺寸停止变化后按新尺寸重取图标; 换成新任务时旧的随之取消.
     refresh_icons: Task<()>,
-    /// 悬停切换分组时等着切过去的分组; 移开时丢掉任务即取消.
-    hover_switch: Option<(Id, Task<()>)>,
+    /// 悬停切换时等着切过去的标签 (None 是推荐页); 移开时丢掉任务即取消.
+    hover_switch: Option<(Option<Id>, Task<()>)>,
+    jev: jev::JevState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -70,19 +87,30 @@ impl Panel {
         let _subscriptions = vec![
             cx.subscribe_in(&search, window, Self::on_search_event),
             cx.subscribe_in(&rename, window, Self::on_rename_event),
-            // 点到别的程序时窗口失活, 输入框不会收到失焦, 在这里提交
+            // 点到别的程序时窗口失活, 输入框不会收到失焦, 在这里提交; 回到面板算打开一次
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.commit_rename(cx);
+                } else {
+                    this.opened(cx);
                 }
             }),
             cx.observe_window_bounds(window, Self::remember_size),
-            cx.observe(&library, |_, _, cx| cx.notify()),
+            cx.observe(&library, |this, _, cx| {
+                this.refresh_search(cx);
+                cx.notify();
+            }),
             // 贴边位置, 窗口大小等其他设置也会触发, 只有图标尺寸变了才重取图标.
             // 拖滑块时尺寸连续在变, 取图标慢, 每格都重取会卡: 先把已有图标缩放显示, 停手后再按新尺寸重取, 换回清晰的
             cx.observe(&settings, {
                 let mut icon_size = settings.read(cx).appearance.icon_size;
+                let mut enabled = settings.read(cx).smart.enabled;
                 move |this, settings, cx| {
+                    if settings.read(cx).smart.enabled != enabled {
+                        enabled = !enabled;
+                        this.set_recommend(enabled, cx);
+                        this.refresh_search(cx);
+                    }
                     let size = settings.read(cx).appearance.icon_size;
                     if size != icon_size {
                         icon_size = size;
@@ -100,12 +128,17 @@ impl Panel {
             }),
         ];
         let active_group = library.read(cx).groups()[0].id;
-        Self {
+        let recommend = settings.read(cx).smart.enabled;
+        let mut panel = Self {
             hwnd: native::hwnd(window),
             library,
             settings,
+            smart_page: recommend,
             active_group,
+            recent: None,
+            read_recent: Task::ready(()),
             search,
+            searched: (Vec::new(), Vec::new()),
             renaming: None,
             rename,
             focus: cx.focus_handle(),
@@ -115,12 +148,86 @@ impl Panel {
             grid_width: Pixels::ZERO,
             backdrop: None,
             link_drop: None,
+            drag_out: None,
             icons: HashMap::new(),
             save_size: Task::ready(()),
             refresh_icons: Task::ready(()),
             hover_switch: None,
+            jev: jev::JevState::new(),
             _subscriptions,
+        };
+        if recommend {
+            panel.refresh_recent(cx);
         }
+        panel
+    }
+
+    /// 设置里开关推荐. 关掉: 回到分组, 丢掉这次打开, 清掉系统最近记录;
+    /// 打开: 像刚启动一样重新读系统最近记录, 读完记一次打开.
+    fn set_recommend(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled {
+            self.refresh_recent(cx);
+        } else {
+            self.smart_page = false;
+            self.recent = None;
+            self.read_recent = Task::ready(());
+            self.library.update(cx, |lib, cx| lib.end_open(cx));
+        }
+    }
+
+    /// 当前标签: None 是推荐页, 否则是分组.
+    fn current_tab(&self) -> Option<Id> {
+        (!self.smart_page).then_some(self.active_group)
+    }
+
+    fn select_tab(&mut self, tab: Option<Id>, cx: &mut Context<Self>) {
+        match tab {
+            None => {
+                self.smart_page = true;
+                self.refresh_recent(cx);
+            }
+            Some(id) => {
+                self.smart_page = false;
+                self.active_group = id;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 后台读系统最近记录, 读完显示到推荐页, 并交给 library 当候选, 新的打开记进启动记录供预测学习.
+    /// 第一次读完时补记启动时那次打开.
+    fn refresh_recent(&mut self, cx: &mut Context<Self>) {
+        let new_since = new_file_since();
+        self.read_recent = cx.spawn(async move |this, cx| {
+            let recent = cx.background_executor().spawn(async move { recent::read(new_since) }).await;
+            this.update(cx, |this, cx| {
+                let lists = [
+                    (&recent.files, "file"),
+                    (&recent.folders, "folder"),
+                    (&recent.programs, "program"),
+                    (&recent.new_files, NEW_FILE),
+                ];
+                let observed: Vec<Observed> = lists
+                    .into_iter()
+                    .flat_map(|(entries, kind)| {
+                        entries.iter().map(move |e| Observed {
+                            name: e.name.clone(),
+                            target: e.target.clone(),
+                            at: e.at,
+                            kind,
+                        })
+                    })
+                    .collect();
+                this.library.update(cx, |lib, cx| lib.sync_system(observed, cx));
+                let first = this.recent.is_none();
+                this.recent = Some(recent);
+                if first {
+                    this.opened(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     /// 窗口移动和改大小都会触发, 大小真的变了才记; 最大化 (双击标题栏) 的大小不记, 免得下次启动铺满屏幕.
@@ -147,15 +254,50 @@ impl Panel {
         self.search.read(cx).value().trim().to_string()
     }
 
-    /// 搜索时跨所有分组匹配, 否则显示当前分组.
+    /// 搜索时跨所有分组匹配, 否则按分组的排序方式显示当前分组.
     fn visible_items(&self, cx: &App) -> Vec<Item> {
+        self.visible(cx).0
+    }
+
+    /// 网格里的项目, 以及搜索时 Jev 认为很可能但名称不匹配的候选 (排在项目后面).
+    fn visible(&self, cx: &App) -> (Vec<Item>, Vec<Ranked>) {
+        if self.query(cx).is_empty() {
+            (self.library.read(cx).sorted_items(self.active_group), Vec::new())
+        } else {
+            self.searched.clone()
+        }
+    }
+
+    /// 按当前搜索词重算搜索结果.
+    fn refresh_search(&mut self, cx: &App) {
         let library = self.library.read(cx);
         let query = self.query(cx);
-        if query.is_empty() {
-            library.group(self.active_group).map_or_else(Vec::new, |g| g.items.clone())
+        self.searched = if query.is_empty() {
+            (Vec::new(), Vec::new())
+        } else if self.settings.read(cx).smart.enabled {
+            library.search(&query, self.search_probabilities(&query))
         } else {
-            library.search(&query).into_iter().cloned().collect()
-        }
+            // 关了推荐只按名称匹配, 按分组和组内顺序排
+            let query = query.to_lowercase();
+            let items = library.groups().iter().flat_map(|g| &g.items);
+            (items.filter(|item| item.name.to_lowercase().contains(&query)).cloned().collect(), Vec::new())
+        };
+    }
+
+    /// 从网格启动的来源: 搜索结果或分组.
+    fn grid_via(&self, cx: &App) -> Via {
+        if self.query(cx).is_empty() { Via::Group } else { Via::Search }
+    }
+
+    /// 设置"按名称去重": 添加项目时分组里已有同名的就不加.
+    fn dedupe_names(&self, cx: &App) -> bool {
+        self.settings.read(cx).general.dedupe_names
+    }
+
+    /// 把文件或文件夹加到分组末尾, 按设置去重.
+    fn add_paths(&self, group: Id, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let by_name = self.dedupe_names(cx);
+        self.library.update(cx, |lib, cx| lib.add_paths(group, paths, by_name, cx));
     }
 
     fn icon(&mut self, target: &Path, cx: &App) -> Option<Arc<RenderImage>> {
@@ -164,21 +306,54 @@ impl Panel {
         self.icons.entry(target.to_path_buf()).or_insert_with(|| shell::icon(target, size)).clone()
     }
 
-    /// 启动项目; 设置了"启动后收起"时收进托盘. 贴边状态下不收, 鼠标离开后它会自己缩回.
-    fn launch(&self, item: &Item, as_admin: bool, cx: &App) {
+    /// 启动项目并记一次启动; 设置了"启动后收起"时收进托盘. 贴边状态下不收, 鼠标离开后它会自己缩回.
+    fn launch(&self, item: &Item, as_admin: bool, via: Via, cx: &mut Context<Self>) {
         shell::run(&item.target, &item.args, as_admin || item.admin);
+        self.library.update(cx, |lib, cx| lib.record_launch(Some(item.id), &item.target, via, cx));
+        self.after_launch(cx);
+    }
+
+    /// 启动不在分组中的系统最近项或新文件.
+    fn launch_target(&self, target: &Path, as_admin: bool, via: Via, cx: &mut Context<Self>) {
+        shell::run(target, "", as_admin);
+        self.library.update(cx, |lib, cx| lib.record_launch(None, target, via, cx));
+        self.after_launch(cx);
+    }
+
+    /// 启动推荐页或搜索结果里的一个候选: 分组里有的按项目启动.
+    fn launch_ranked(&self, ranked: &Ranked, via: Via, cx: &mut Context<Self>) {
+        match &ranked.item {
+            Some(item) => self.launch(item, false, via, cx),
+            None => self.launch_target(&ranked.target, false, via, cx),
+        }
+    }
+
+    fn after_launch(&self, cx: &App) {
         let settings = self.settings.read(cx);
         if settings.general.hide_after_launch && settings.window.docked.is_none() {
             native::hide(self.hwnd);
         }
     }
 
+    /// 内容区: 搜索结果和分组用图标网格, 推荐页单独排版.
+    fn render_content(&mut self, searching: bool, cx: &mut Context<Self>) -> AnyElement {
+        if self.smart_page && !searching {
+            self.render_smart(cx).into_any_element()
+        } else {
+            self.render_grid(searching, cx).into_any_element()
+        }
+    }
+
     fn on_search_event(&mut self, _: &Entity<InputState>, event: &InputEvent, _: &mut Window, cx: &mut Context<Self>) {
         match event {
-            InputEvent::Change => cx.notify(),
+            InputEvent::Change => {
+                self.refresh_search(cx);
+                self.search_changed(cx);
+                cx.notify();
+            }
             InputEvent::PressEnter { .. } => {
                 if let Some(item) = self.visible_items(cx).first() {
-                    self.launch(item, false, cx);
+                    self.launch(item, false, Via::Search, cx);
                 }
             }
             _ => {}
@@ -186,11 +361,18 @@ impl Panel {
     }
 }
 
-/// 拖动中的项目, 同时是跟随鼠标的预览.
+/// 这个时间 (Unix 毫秒) 之后修改的下载和桌面文件算新文件.
+fn new_file_since() -> i64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_millis() as i64;
+    now - PARAMS.learn.new_file_days * 86_400_000
+}
+
+/// 拖动中的项目, 同时是跟随鼠标的预览. target 用于拖出面板.
 #[derive(Clone)]
 struct DraggedItem {
     id: Id,
     name: SharedString,
+    target: PathBuf,
 }
 
 /// 拖动中的分组, 同时是跟随鼠标的预览.
@@ -388,13 +570,13 @@ impl Render for Panel {
                 .min_h_0()
                 .items_start()
                 .when(!searching, |el| el.child(self.render_tabs(true, cx)))
-                .child(self.render_grid(searching, cx))
+                .child(self.render_content(searching, cx))
         } else {
             v_flex()
                 .flex_1()
                 .min_h_0()
                 .when(!searching, |el| el.child(self.render_tabs(false, cx)))
-                .child(self.render_grid(searching, cx))
+                .child(self.render_content(searching, cx))
         };
 
         v_flex()
@@ -407,6 +589,8 @@ impl Render for Panel {
             .on_drag_move(Self::track_drop_root::<DraggedItem>(cx))
             .on_drag_move(Self::track_drop_root::<DraggedGroup>(cx))
             .on_drag_move(cx.listener(Self::track_link_drop))
+            .on_drag_move(Self::track_drag_out_item(cx))
+            .on_drag_move(Self::track_drag_out_tile(cx))
             .child(self.render_header(cx))
             .child(body)
             .children(self.render_insert_line(cx))

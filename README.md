@@ -15,22 +15,44 @@
 
 ## ✨ Features
 
-- **Grouped panel**: organize items into tabs; right-click a tab to rename or delete it.
+- **Grouped panel**: organize items into tabs; right-click a tab to rename it, delete it or sort it by click count.
 - **Drag and drop**: drop files, folders or shortcuts onto the panel; their system icons are picked up automatically.
+  A target already in the group is not added twice; items with the same name can be skipped too (a setting).
 - **Click to launch**: files, folders, shortcuts and URLs open with their default handler.
-- **Search**: filter by name across all groups; press Enter to open the first match.
-- **Item menu**: run as administrator, open with, open file location, copy path, edit (name, target, arguments,
-  always run as administrator) and delete.
+- **Import from Rolan**: on the Data page of settings, bring in Rolan 2's groups and items in one click; groups with the
+  same name are merged, existing targets are skipped, and click counts come along.
+- **Recommended page** (can be turned off in settings): pinned before the groups, showing what you are likely to open next, your most used items, and the
+  files, folders and programs Windows recently opened. Predictions use the local launch history (frequency, hour of
+  day, weekday or weekend, what you usually open next) and the situation when the panel opens (foreground program and
+  window title, clipboard type, running programs), and learn their weights from what you pick or skip each time.
+  Optionally, enter an API base URL and key in settings to let the Jev decision model weigh in. While recommendations
+  are on, QRun also keeps a local activity timeline of the last 2 hours (foreground window and title, programs starting
+  and exiting, file changes in your user folder and on other local drives, clipboard type, ports starting to listen).
+  Recommended files and folders come only from what you opened (Windows recent items and each program's jump list);
+  file changes just move those up, so logs, databases and caches written by programs are never recommended. It records
+  paths, names and times only, never file or clipboard contents, lives in `qrun.db`, and anything older than
+  2 hours is dropped.
+- **Search**: filter by name across all groups, ranked by what you are most likely to open now; press Enter to open the
+  first match.
+- **Item menu**: run as administrator, open with, open file location, copy path, copy file, edit (name, target,
+  arguments, always run as administrator) and delete. Tiles on the recommended page have a menu too, and ones not in a
+  group can be added to one.
+- **Drag out**: drag a file from a group or the recommended page out of the panel and drop it into WeChat, File
+  Explorer and so on (it is copied, never moved). Programs are dragged out as shortcuts by default (this can be changed
+  in settings); shortcuts stay shortcuts. Dragging over a group tab switches to that group, also for files
+  dragged in from outside.
 - **Edge docking**: drag the panel to the top, left or right edge (or past it) to dock; it slides off-screen when the
   mouse leaves and slides back when the mouse touches that edge.
 - **System tray**: the panel stays out of the taskbar; click the tray icon to show it, right-click for the menu.
 - **Settings window**: open it from the gear button or the tray menu. Pages: General (start with Windows, single or
-  double click to launch, switch groups on hover, always on top, hide after launch), Appearance (font, horizontal or vertical tabs, icon size, opacity), Docking and About (version, updates).
+  double click to launch, switch groups on hover, always on top, hide after launch, skip duplicate names, drag programs out as shortcuts or files), Appearance (font, horizontal or vertical tabs, icon size, opacity), Recommended, Docking, Data (data folder, import from Rolan) and About (version, updates).
 - **Start with Windows**: registered under the current user's `Run` registry key, only when you turn it on.
 - **Updates**: checks for new releases at startup and every 24 hours (GitHub first, then the
   [CNB mirror](https://cnb.cool/alsc1n/qrun) for users in China). The installed version downloads the installer,
   verifies its SHA-256 and updates itself; the portable version opens the download page.
-- **Portable data**: `settings.json` and `library.json` live next to the executable, so the whole folder can be moved.
+- **Data location**: `settings.json`, `qrun.db` and the log live in `%LOCALAPPDATA%\QRun` by default, for both the
+  installed and the portable version. Type a path or pick a folder on the Data page of settings to move them (for
+  example next to the executable, to carry a portable copy around); the data is moved over and QRun restarts.
 
 Planned: a global hotkey.
 
@@ -49,8 +71,9 @@ The release executable is `target/release/qrun.exe`.
 
 ## ⚙️ Configuration
 
-Two files are created next to the executable on first run. `settings.json` holds the preferences, which are normally
-changed from the settings window:
+`settings.json` and `qrun.db` are created in the data folder on first run (`%LOCALAPPDATA%\QRun` by default; the Data
+page of settings opens and changes it). `settings.json` holds the preferences,
+which are normally changed from the settings window:
 
 | Field | Meaning |
 | --- | --- |
@@ -58,9 +81,15 @@ changed from the settings window:
 | `general.hover_switch_group` | Switch groups by resting the mouse on a group tab |
 | `general.always_on_top` | Keep the panel above other windows when not docked (it is always on top while docked) |
 | `general.hide_after_launch` | Hide the panel after launching an item (not while docked) |
+| `general.dedupe_names` | Skip an item being added when its group already has one with the same name (case-insensitive). Off by default: it is added under the same name for you to rename. An item whose target is already in the group is never added again |
+| `general.drag_program` | `shortcut` (a program dragged out of the panel becomes a shortcut carrying the item's name and arguments) or `file` (the program itself); shortcuts are always dragged as they are |
 | `appearance.tab_layout` | `horizontal` (tabs above the icons) or `vertical` (tabs on the left) |
 | `appearance.font_family` | UI font family, `HarmonyOS Sans SC` by default (shipped in the `fonts` folder next to the executable). Empty means the system font, Segoe UI with Microsoft YaHei for Chinese; a font that is neither installed nor in `fonts` also falls back to it |
 | `appearance.icon_size` / `appearance.opacity` | Icon display size, and panel background opacity from 0 to 1 |
+| `smart.enabled` | Recommendations on or off. When off, the recommended page is hidden, Windows recent items are not read, no activity timeline is kept, nothing is learned, Jev is not called and search matches by name only; learned data is kept |
+| `smart.predict` / `smart.frequent` / `smart.recent_files` / `smart.recent_folders` / `smart.recent_programs` | How many entries each recommended page section shows at most; 0 hides the section |
+| `smart.jev_base_url` | Base URL of the Jev API, TypeSafe's official `https://api.typesafe.ai/v1` by default; requests go to `{base}/systemone` |
+| `smart.jev_key` | API key for the Jev decision model; an empty URL or key turns Jev off. When set, the foreground program and window title, recent launches and the candidate list are sent to the base URL |
 | `dock.enabled` | Whether edge docking is on |
 | `dock.lock_position` | Lock the docked panel: it cannot be dragged away, and launching QRun again does not undock it |
 | `dock.snap_distance` | How close to an edge (logical pixels) the panel must be dropped to dock |
@@ -69,12 +98,16 @@ changed from the settings window:
 
 Start with Windows is not stored here; the registry is the single source of truth.
 
-Both files carry a top-level `version` for their structure. Missing settings fall back to their defaults, while
+`settings.json` carries a top-level `version` for its structure. Missing settings fall back to their defaults, while
 unknown field names are reported as errors. A file written by a newer QRun is left untouched and QRun asks you to
 upgrade.
 
-`library.json` holds the groups and their items. Each item has an `id`, `name` and `target`, plus optional `args` and
-`admin`. If either file cannot be read, QRun shows the reason and exits instead of starting with broken data.
+`qrun.db` is an SQLite database holding the groups, their items and the launch history, versioned through
+`user_version` under the same rules. The launch history keeps accumulating and drives sorting by click count.
+During the compatibility period the groups and items are also written to a `library.json` in the 0.1.0 format, so
+downgrading keeps your data (0.1.0 reports that `settings.json` comes from a newer version; delete it to start);
+if it was changed by an older QRun, it wins when you upgrade again.
+If either file cannot be read, QRun shows the reason and exits instead of starting with broken data.
 
 ## 🤝 Contributing
 
