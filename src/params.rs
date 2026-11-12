@@ -13,6 +13,8 @@ pub struct Params {
     pub learn: Learn,
     pub jev: Jev,
     pub timeline: Timeline,
+    pub history: History,
+    pub redact: Redact,
     /// 与 installer/qrun.iss 的 AppId 一致, 用来找安装包写入的卸载信息.
     pub installer_app_id: String,
 }
@@ -159,6 +161,30 @@ pub struct Timeline {
     pub cooccur_half_life_days: i64,
     /// 给 Jev 看最近多少条活动.
     pub jev_events: usize,
+}
+
+/// 长期保留的活动记录 (model::library::timeline 归档进 history), 回放用.
+#[derive(Deserialize)]
+pub struct History {
+    /// 结束超过这么久的事件才归档: 要长于前台心跳合并, 同一文件连着改的合并, 人离开时往回截的范围, 归档后不会再变.
+    pub archive_after_minutes: i64,
+    /// 设置里 "保留天数" 的默认值.
+    pub retention_days: u32,
+}
+
+/// 脱敏 (model::redact) 和剪贴板读取.
+#[derive(Deserialize)]
+pub struct Redact {
+    /// 剪贴板文字只读开头这么多个字符; 看开头就够判断是什么, 也少碰内容.
+    pub clip_chars: usize,
+    /// 跟在这些字样后 (用 = 或 : 隔开) 的值一律换掉, 拦住不随机的弱密码; 不分大小写.
+    pub keywords: Vec<String>,
+    /// 至少这么长的串才可能被当成随机串 (密钥, 令牌, 哈希).
+    pub min_secret_len: usize,
+    /// 随机串里字母和数字至少交替这么多次; 驼峰标识符和单词连写交替很少, 不会被误伤.
+    pub min_digit_switches: usize,
+    /// 随机串的香农熵至少达到这么长的串理论上限的这个比例.
+    pub entropy_ratio: f64,
 }
 
 pub static PARAMS: LazyLock<Params> =

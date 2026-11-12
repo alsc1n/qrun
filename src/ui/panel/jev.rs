@@ -13,6 +13,7 @@ use windows::Win32::Foundation::HWND;
 use super::Panel;
 use crate::model::jev;
 use crate::model::library::{self, NEW_FILE, Observed, Situation};
+use crate::model::redact::redact;
 use crate::params::PARAMS;
 use crate::platform::{self, context, http, recent};
 
@@ -117,7 +118,7 @@ impl Panel {
             .as_ref()
             .filter(|p| Some(&p.watched) == external.as_ref() && p.at.elapsed() < minutes(PARAMS.jev.stale_minutes))
             .and_then(|p| p.probabilities.clone());
-        let situation = self.situation();
+        let situation = self.situation(cx);
         let shown = self.settings.read(cx).smart.predict as usize;
         self.library.update(cx, |lib, cx| {
             lib.begin_open(situation, shown, fresh.as_ref().filter(|_| !keep_order), keep_order, cx)
@@ -179,7 +180,7 @@ impl Panel {
             return;
         }
         self.scan_new_files(cx);
-        let request = self.library.read(cx).prefetch_jev_request(&self.situation());
+        let request = self.library.read(cx).prefetch_jev_request(&self.situation(cx));
         let ask = self.ask_jev(request, cx);
         self.jev.prefetch = Some(cx.spawn(async move |this, cx| {
             let result = ask.await;
@@ -195,10 +196,12 @@ impl Panel {
     /// 扫一遍下载和桌面 (系统最近记录在后台读, 赶不上这次打开), 返回有没有新出现的文件.
     /// 有的话之前问 Jev 的结果里没有它, 按概率 0 算会被埋掉, 作废重问.
     fn scan_new_files(&mut self, cx: &mut Context<Self>) -> bool {
-        let found = recent::new_files(super::new_file_since())
-            .into_iter()
-            .map(|e| Observed { name: e.name, target: e.target, at: e.at, kind: NEW_FILE })
-            .collect();
+        let found = match self.settings.read(cx).smart.collect.new_files {
+            true => recent::new_files(super::new_file_since()),
+            false => Vec::new(),
+        };
+        let found =
+            found.into_iter().map(|e| Observed { name: e.name, target: e.target, at: e.at, kind: NEW_FILE }).collect();
         let appeared = self.library.update(cx, |lib, _| lib.sync_new_files(found));
         if appeared {
             self.jev.prefetch = None;
@@ -238,16 +241,20 @@ impl Panel {
         self.jev.search.as_ref().filter(|(q, _)| q == query).map(|(_, probabilities)| probabilities)
     }
 
-    /// 打开 QRun 前在用的窗口, 剪贴板类型, 开着的窗口; 前台窗口已关掉时它的几项为空.
-    fn situation(&self) -> Situation {
+    /// 打开 QRun 前在用的窗口, 剪贴板类型, 开着的窗口; 前台窗口已关掉时它的几项为空. 标题已脱敏.
+    /// 收集里关掉了窗口时窗口几项都为空.
+    fn situation(&self, cx: &App) -> Situation {
+        if !self.settings.read(cx).smart.collect.window {
+            return Situation { clipboard: context::clipboard_kind().map(str::to_string), ..Situation::default() };
+        }
         let window = self.jev.external.as_ref().map(|(watched, _)| context::window_info(watched.hwnd));
         Situation {
             foreground: window.as_ref().and_then(|w| w.program.clone()),
-            title: window.map(|w| w.title).filter(|title| !title.is_empty()),
+            title: window.map(|w| redact(&w.title).text).filter(|title| !title.is_empty()),
             clipboard: context::clipboard_kind().map(str::to_string),
             windows: context::windows()
                 .into_iter()
-                .map(|w| library::Window { program: w.program, title: w.title })
+                .map(|w| library::Window { program: w.program, title: redact(&w.title).text })
                 .collect(),
         }
     }

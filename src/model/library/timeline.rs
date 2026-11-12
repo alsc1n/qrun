@@ -1,12 +1,13 @@
 //! 活动时间线: 传感器 (app::sensors) 报来的前台窗口, 离开, 程序启停, 剪贴板, 文件改动, 监听端口, 以及从 QRun 打开的目标,
 //! 合并降噪后放在内存里, 只留最近 keep_minutes, 最多 max_events 条; 定期和退出时整表覆盖写进库, 重启后读回.
-//! 每次打开 QRun 时最近 summary_events 条随那次打开存下 (opens.recent), 以后换特征可回放.
+//! 每次打开 QRun 时最近 summary_events 条随那次打开存下 (opens.recent). 不会再变的事件另外归档进 history,
+//! 保留 retention_days 天 (设置里可改), 回放用.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Library, is_own, now_ms, own_dirs};
@@ -16,6 +17,7 @@ use crate::storage;
 
 const SECOND: i64 = 1000;
 const MINUTE: i64 = 60_000;
+const DAY: i64 = 86_400_000;
 
 /// 时间线上的一条; start..end 是 Unix 毫秒, 瞬间发生的两者相等.
 #[derive(Clone, Serialize, Deserialize)]
@@ -42,9 +44,20 @@ pub enum What {
     Exited {
         program: String,
     },
-    /// 剪贴板换了内容, 只记类型.
+    /// 剪贴板换了内容: 类型 (files / image / rich text / text), 从哪个程序复制的, 文字是脱敏后的开头
+    /// (大半是密钥时不留, 只留形状), 文件只记扩展名; 受保护的 (密码管理器复制的) 只有类型和来源.
     Clipboard {
         content: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shapes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        protected: bool,
     },
     /// change: created / modified / removed / renamed.
     File {
@@ -70,6 +83,20 @@ pub enum What {
     },
 }
 
+impl What {
+    /// 只记类型的一次复制 (收集里关掉了剪贴板内容).
+    pub fn clipboard_kind(content: &str) -> Self {
+        Self::Clipboard {
+            content: content.to_string(),
+            from: String::new(),
+            text: None,
+            shapes: Vec::new(),
+            files: Vec::new(),
+            protected: false,
+        }
+    }
+}
+
 pub(super) struct Timeline {
     /// 早的在前; 前台窗口会被后续心跳延长, 所以只是大致按结束时间排.
     pub(super) events: VecDeque<Event>,
@@ -79,11 +106,14 @@ pub(super) struct Timeline {
     own_dirs: Vec<String>,
     /// 上次写库之后有没有变.
     dirty: bool,
+    /// 结束时间不晚于这个时刻 (Unix 毫秒) 的事件都已归档进 history.
+    archived: i64,
 }
 
 impl Timeline {
     /// 库里存的时间线, 去掉已超过 keep_minutes 的.
     pub(super) fn read(db: &Connection) -> rusqlite::Result<Self> {
+        let archived = db.query_row("SELECT coalesce(max(end), 0) FROM history", [], |row| row.get(0))?;
         let since = now_ms() - PARAMS.timeline.keep_minutes * MINUTE;
         let texts = db
             .prepare("SELECT event FROM timeline ORDER BY rowid")?
@@ -96,7 +126,7 @@ impl Timeline {
             })
             .filter(|event| event.end >= since)
             .collect();
-        Ok(Self { events, bursts: HashMap::new(), own_dirs: own_dirs(), dirty: false })
+        Ok(Self { events, bursts: HashMap::new(), own_dirs: own_dirs(), dirty: false, archived })
     }
 
     /// 最近 n 条, 早的在前.
@@ -264,11 +294,12 @@ impl Library {
         self.timeline.push(What::Away, since, now_ms());
     }
 
-    /// 时间线有变化时整表覆盖写进库. 定期和退出时调用.
+    /// 时间线有变化时整表覆盖写进库, 不会再变的事件归档. 定期和退出时调用.
     pub fn save_timeline(&mut self) {
         let window = PARAMS.timeline.burst_window_seconds * SECOND;
         let now = now_ms();
         self.timeline.bursts.retain(|_, times| times.back().is_some_and(|&at| now - at <= window));
+        self.archive(now);
         if !self.timeline.dirty {
             return;
         }
@@ -286,6 +317,43 @@ impl Library {
         match result {
             Ok(()) => self.timeline.dirty = false,
             Err(e) => storage::db_save_failed(&e),
+        }
+    }
+
+    /// 内存里只留 keep_minutes, 回放要更久的: 结束超过 archive_after_minutes 的事件不会再被延长或合并
+    /// (前台心跳, 同一文件连着改, 人离开时往回截都在这之内), 追加进 history 长期保留.
+    fn archive(&mut self, now: i64) {
+        let cutoff = now - PARAMS.history.archive_after_minutes * MINUTE;
+        let archived = self.timeline.archived;
+        let result = (|| -> rusqlite::Result<()> {
+            let tx = self.db.unchecked_transaction()?;
+            {
+                let mut insert = tx.prepare("INSERT INTO history (start, end, event) VALUES (?1, ?2, ?3)")?;
+                for event in self.timeline.events.iter().filter(|e| e.end > archived && e.end <= cutoff) {
+                    let text = serde_json::to_string(&event.what).expect("serialize event");
+                    insert.execute(params![event.start, event.end, text])?;
+                }
+            }
+            tx.commit()
+        })();
+        match result {
+            Ok(()) => self.timeline.archived = cutoff,
+            Err(e) => storage::db_save_failed(&e),
+        }
+    }
+
+    /// 删掉 retention_days 天前的活动记录和打开时的情境 (启动记录留着, 常用度和钟点靠它); 定期调用.
+    pub fn prune(&mut self, retention_days: u32) {
+        let before = now_ms() - retention_days as i64 * DAY;
+        let result = self.db.execute_batch(&format!(
+            "DELETE FROM history WHERE end < {before};
+             DELETE FROM shown WHERE open_id IN (SELECT id FROM opens WHERE at < {before});
+             UPDATE launches SET open_id = NULL WHERE open_id IN (SELECT id FROM opens WHERE at < {before});
+             DELETE FROM opens WHERE at < {before};
+             DELETE FROM skips WHERE at < {before};"
+        ));
+        if let Err(e) = result {
+            storage::db_save_failed(&e);
         }
     }
 }

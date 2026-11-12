@@ -40,7 +40,7 @@ pub struct Settings {
 }
 
 /// 推荐 (界面上的名称, 代码里叫 smart): 开关, 推荐页各块最多显示几个 (0 表示不显示这一块), Jev 的接口地址和密钥.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct Smart {
     /// 关掉时不显示推荐页, 不读系统最近记录, 不调 Jev, 不学习, 搜索只按名称; 已学到的数据保留.
@@ -55,6 +55,34 @@ pub struct Smart {
     /// Jev 的 API 密钥; 地址或密钥为空表示不用 Jev, 只按本地算法排.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub jev_key: String,
+    /// 收集哪些信息; 关掉的那类不读也不记, 推荐照常, 只是少这类信息.
+    pub collect: Collect,
+    /// 活动记录和每次打开时的情境保留多少天, 更早的删掉.
+    pub retention_days: u32,
+}
+
+/// 推荐收集的各类信息, 每类一个开关, 默认都开.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(default, deny_unknown_fields)]
+pub struct Collect {
+    /// 前台窗口的程序和标题, 开着的窗口.
+    pub window: bool,
+    /// 剪贴板内容 (脱敏后的文字开头, 来源程序, 文件扩展名); 关掉只记类型.
+    pub clipboard: bool,
+    /// 程序启动, 退出和监听的端口.
+    pub processes: bool,
+    /// 用户目录和其他本地硬盘上的文件改动.
+    pub files: bool,
+    /// 下载文件夹和桌面上的新文件.
+    pub new_files: bool,
+    /// 系统最近记录和各程序的跳转列表.
+    pub system_recent: bool,
+}
+
+impl Default for Collect {
+    fn default() -> Self {
+        Self { window: true, clipboard: true, processes: true, files: true, new_files: true, system_recent: true }
+    }
 }
 
 impl Smart {
@@ -198,6 +226,8 @@ impl Default for Smart {
             recent_programs: 8,
             jev_base_url: PARAMS.jev.base_url.clone(),
             jev_key: String::new(),
+            collect: Collect::default(),
+            retention_days: PARAMS.history.retention_days,
         }
     }
 }

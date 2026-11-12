@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Read};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -65,16 +66,17 @@ pub struct RecentEntry {
 }
 
 /// 读一遍系统最近记录; new_since 之后 (Unix 毫秒) 修改的下载和桌面文件算新文件.
+/// system 为 false 时不读最近记录和跳转列表, new_since 为 None 时不扫新文件 (收集里关掉了), 对应几项为空.
 /// 要解析几百个快捷方式, 在后台线程调用; 自己初始化 COM.
-pub fn read(new_since: i64) -> Recent {
+pub fn read(system: bool, new_since: Option<i64>) -> Recent {
     // 后台线程池的线程会复用: 已按别的模式初始化过时返回 RPC_E_CHANGED_MODE, COM 照样可用, 只是不归这里反初始化
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_ok();
-    let (files, folders) = documents();
+    let (files, folders) = if system { documents() } else { (Vec::new(), Vec::new()) };
     let recent = Recent {
         files,
         folders,
-        programs: programs(),
-        new_files: new_files(new_since),
+        programs: if system { programs() } else { Vec::new() },
+        new_files: new_since.map(new_files).unwrap_or_default(),
         tracks_documents: switch_on(w!("Start_TrackDocs")),
         tracks_programs: switch_on(w!("Start_TrackProgs")),
     };
@@ -181,9 +183,12 @@ fn unix_ms(filetime: u64) -> i64 {
     ((filetime - FILETIME_UNIX_EPOCH) / 10_000) as i64
 }
 
-/// 下载文件夹和桌面上 since 之后修改的文件 (不进子目录). 快捷方式, 系统文件和还没下完的临时文件不算.
+/// 下载文件夹和桌面上 since 之后修改的文件 (不进子目录). 快捷方式, 系统文件, 还没下完的临时文件不算;
+/// 隐藏文件和 . 或 ~ 开头的文件也不算: 文档打开时办公软件旁边生成的锁文件 (LibreOffice / WPS 的 .~lock.xxx#,
+/// Office 的 ~$xxx) 都是这样.
 pub fn new_files(since: i64) -> Vec<RecentEntry> {
     const SKIP: [&str; 6] = ["lnk", "ini", "tmp", "crdownload", "part", "download"];
+    const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
     let mut files = Vec::new();
     for folder in [&FOLDERID_Downloads, &FOLDERID_Desktop] {
         let Ok(entries) = fs::read_dir(known_folder(folder)) else {
@@ -196,7 +201,9 @@ pub fn new_files(since: i64) -> Vec<RecentEntry> {
             };
             let skipped =
                 path.extension().is_some_and(|ext| SKIP.contains(&ext.to_string_lossy().to_lowercase().as_str()));
-            if !metadata.is_file() || skipped {
+            let temporary = entry.file_name().to_string_lossy().starts_with(['.', '~'])
+                || metadata.file_attributes() & HIDDEN_OR_SYSTEM != 0;
+            if !metadata.is_file() || skipped || temporary {
                 continue;
             }
             let Ok(modified) = metadata.modified() else {

@@ -3,5 +3,6 @@
 pub mod jev;
 pub mod library;
 pub mod predict;
+pub mod redact;
 pub mod rolan;
 pub mod settings;

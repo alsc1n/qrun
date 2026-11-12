@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use super::predict::{self, Facets, Launch, Model, Tuning, Weights};
+use super::redact::redact;
 use super::rolan;
 use crate::params::PARAMS;
 use crate::storage;
@@ -24,7 +25,7 @@ pub use smart::{Ranked, Situation, Via, Window};
 pub use timeline::What;
 
 /// 库结构版本; 破坏性变更时加一, 并在 migrate 里加上从旧版本迁移的语句.
-const DB_VERSION: u32 = 8;
+const DB_VERSION: u32 = 11;
 const LEGACY_FILE: &str = "library.json";
 const LEGACY_VERSION: u32 = 1;
 
@@ -136,6 +137,12 @@ const SCHEMA_V7: &str = "
 /// 步长都偏了, 删掉让它们从 params.json 的起步值重新学; 其余权重保留.
 const SCHEMA_V8: &str = "
     DELETE FROM weights WHERE name IN ('modified', 'focused', 'started', 'nearby');
+";
+
+/// 11: 归档的活动时间线 (已脱敏), 内存里只留 2 小时, 这里留 retention_days 天, 回放用. event 是 What 的 JSON.
+const SCHEMA_V11: &str = "
+    CREATE TABLE history (start INTEGER NOT NULL, end INTEGER NOT NULL, event TEXT NOT NULL);
+    CREATE INDEX history_end ON history (end);
 ";
 
 const INSERT_LAUNCH: &str = "INSERT INTO launches (item_id, target, at, source, week_minute, open_id, via, rank)
@@ -789,8 +796,69 @@ fn migrate(from: u32, db: &Transaction) -> rusqlite::Result<()> {
         5 => db.execute_batch(SCHEMA_V6),
         6 => db.execute_batch(SCHEMA_V7),
         7 => db.execute_batch(SCHEMA_V8),
+        // 10: 9 的规则漏了厂商前缀加十六进制的密钥 (sk_ 加 32 位), 按改好的规则再脱敏一遍, 含剪贴板文字
+        8 | 9 => redact_saved(db),
+        10 => db.execute_batch(SCHEMA_V11),
         _ => unreachable!("qrun.db 没有版本 {from} 的迁移"),
     }
+}
+
+/// 9: 窗口标题改为脱敏后再记, 已存下的打开时的标题, 开着的窗口, 最近活动, 时间线也脱敏重写.
+fn redact_saved(db: &Transaction) -> rusqlite::Result<()> {
+    type Row = (i64, Option<String>, Option<String>, Option<String>);
+    let opens: Vec<Row> = db
+        .prepare("SELECT id, title, windows, recent FROM opens")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, title, windows, recent) in opens {
+        db.execute(
+            "UPDATE opens SET title = ?2, windows = ?3, recent = ?4 WHERE id = ?1",
+            params![
+                id,
+                title.map(|t| redact(&t).text),
+                windows.map(|json| redact_titles(&json)),
+                recent.map(|json| redact_titles(&json))
+            ],
+        )?;
+    }
+    let events: Vec<(i64, String)> = db
+        .prepare("SELECT rowid, event FROM timeline")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (rowid, event) in events {
+        db.execute("UPDATE timeline SET event = ?2 WHERE rowid = ?1", params![rowid, redact_titles(&event)])?;
+    }
+    Ok(())
+}
+
+/// 把 JSON 里所有 title 字段 (开着的窗口, 前台窗口事件) 和剪贴板事件的 text 字段脱敏; text 大半是密钥时整个去掉,
+/// 与新记的一致.
+fn redact_titles(json: &str) -> String {
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(text)) = map.get("text") {
+                    let redacted = redact(text);
+                    if redacted.mostly_secret {
+                        map.remove("text");
+                    } else {
+                        map.insert("text".into(), redacted.text.into());
+                    }
+                }
+                for (key, value) in map.iter_mut() {
+                    match value {
+                        serde_json::Value::String(text) if key == "title" => *text = redact(text).text,
+                        _ => walk(value),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let mut value: serde_json::Value = serde_json::from_str(json).expect("qrun.db 里存的是 JSON");
+    walk(&mut value);
+    value.to_string()
 }
 
 /// 本地时间在一周里的分钟数 (周一 0 点为 0) 的 SQL 表达式, at 是 Unix 毫秒.

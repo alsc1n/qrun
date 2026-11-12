@@ -263,8 +263,10 @@ fn poll(
                 let dropped = file.is_some_and(|file| shell::drag_out(hwnd, &file));
                 panel.update(cx, |panel, cx| panel.dragged_out(dropped, cx));
             }
-            let recommend = settings.read_with(cx, |s, _| s.smart.enabled);
-            cx.update(|cx| sensors.tick(&library, recommend, cx));
+            cx.update(|cx| {
+                let smart = settings.read(cx).smart.clone();
+                sensors.tick(&library, &smart, cx)
+            });
 
             if settings.read_with(cx, |s, _| s.general.auto_check_updates) && Instant::now() >= next_check {
                 next_check = Instant::now() + check_interval;

@@ -1,4 +1,5 @@
 //! 活动时间线的传感器: 每轮轮询看前台窗口, 人是否离开, 剪贴板; 隔几秒看程序启停和监听端口; 收文件改动.
+//! 窗口标题和剪贴板文字先脱敏 (model::redact) 再交出去, 内存和库里都没有明文.
 //! 读到的交给 Library 合并记下, 定期写库. 关了推荐时什么都不读, 文件监听也停掉.
 
 use std::collections::{HashMap, HashSet};
@@ -8,9 +9,11 @@ use std::time::{Duration, Instant};
 use gpui_kit::*;
 
 use crate::model::library::{Library, What};
+use crate::model::redact::redact;
+use crate::model::settings::{Collect, Smart};
 use crate::params::PARAMS;
 use crate::platform::activity::{self, FileWatcher};
-use crate::platform::context;
+use crate::platform::context::{self, Clip, ClipboardBusy};
 
 pub struct Sensors {
     /// 推荐开着时才有.
@@ -44,24 +47,29 @@ impl Sensors {
         }
     }
 
-    /// app::poll 每轮调用. enabled 是推荐开关.
-    pub fn tick(&mut self, library: &Entity<Library>, enabled: bool, cx: &mut App) {
-        if !enabled {
-            if self.watcher.is_some() {
-                *self = Self::new();
-            }
+    /// app::poll 每轮调用. 推荐关着时什么都不读; collect 里关掉的那类不读也不记.
+    pub fn tick(&mut self, library: &Entity<Library>, smart: &Smart, cx: &mut App) {
+        if !smart.enabled {
+            *self = Self::new();
             return;
         }
-        let files = self.watcher.get_or_insert_with(|| FileWatcher::new(roots())).take();
+        let collect = smart.collect;
+        let files = match collect.files {
+            true => self.watcher.get_or_insert_with(|| FileWatcher::new(roots())).take(),
+            false => {
+                self.watcher = None;
+                Vec::new()
+            }
+        };
         library.update(cx, |library, _| {
             for (root, change, path) in files {
                 library.record_file(&root, change.as_str(), &path);
             }
-            self.sense(library);
+            self.sense(library, collect, smart.retention_days);
         });
     }
 
-    fn sense(&mut self, library: &mut Library) {
+    fn sense(&mut self, library: &mut Library, collect: Collect, retention_days: u32) {
         let away = context::idle() >= minutes(PARAMS.jev.idle_minutes);
         match self.away {
             None if away => self.away = Some(library.record_away(context::idle())),
@@ -73,34 +81,55 @@ impl Sensors {
         }
         // QRun 自己的窗口不算, 打开 QRun 前在用的窗口停在打开那一刻
         if !away
+            && collect.window
             && let Some(hwnd) = context::foreground()
             && context::process_id(hwnd) != std::process::id()
         {
             let window = context::window_info(hwnd);
             let program = window.program.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-            library.record(What::Focus { program, title: window.title });
+            library.record(What::Focus { program, title: redact(&window.title).text });
         }
 
         let clipboard = context::clipboard_sequence();
         if clipboard != self.clipboard {
-            self.clipboard = clipboard;
-            if let Some(content) = context::clipboard_kind() {
-                library.record(What::Clipboard { content: content.to_string() });
+            if !collect.clipboard {
+                self.clipboard = clipboard;
+                if let Some(content) = context::clipboard_kind() {
+                    library.record(What::clipboard_kind(content));
+                }
+            } else {
+                // 别的程序正占着剪贴板时不更新版本号, 下一轮再读
+                match context::read_clipboard(PARAMS.redact.clip_chars) {
+                    Err(ClipboardBusy) => {}
+                    Ok(clip) => {
+                        self.clipboard = clipboard;
+                        if let Some(clip) = clip {
+                            library.record(clipboard_event(clip));
+                        }
+                    }
+                }
             }
         }
 
         let now = Instant::now();
-        if now >= self.next_processes {
-            self.next_processes = now + Duration::from_secs(PARAMS.timeline.process_interval_seconds);
-            self.processes(library);
-        }
-        if now >= self.next_ports {
-            self.next_ports = now + Duration::from_secs(PARAMS.timeline.port_interval_seconds);
-            self.ports(library);
+        if !collect.processes {
+            // 重新打开时第一次只记下现状, 不把关着期间开的程序都当成刚启动
+            self.running = None;
+            self.ports = None;
+        } else {
+            if now >= self.next_processes {
+                self.next_processes = now + Duration::from_secs(PARAMS.timeline.process_interval_seconds);
+                self.processes(library);
+            }
+            if now >= self.next_ports {
+                self.next_ports = now + Duration::from_secs(PARAMS.timeline.port_interval_seconds);
+                self.ports(library);
+            }
         }
         if now >= self.next_save {
             self.next_save = now + minutes(PARAMS.timeline.save_minutes);
             library.save_timeline();
+            library.prune(retention_days);
         }
     }
 
@@ -139,6 +168,19 @@ impl Sensors {
             }
         }
         self.ports = Some(ports);
+    }
+}
+
+/// 一次复制记进时间线前先脱敏; 大半是密钥时文字不留, 只留形状.
+fn clipboard_event(clip: Clip) -> What {
+    let redacted = clip.text.as_deref().map(redact);
+    What::Clipboard {
+        content: clip.kind.to_string(),
+        from: clip.owner.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+        text: redacted.as_ref().filter(|r| !r.mostly_secret).map(|r| r.text.clone()),
+        shapes: redacted.map(|r| r.shapes).unwrap_or_default(),
+        files: clip.extensions,
+        protected: clip.protected,
     }
 }
 

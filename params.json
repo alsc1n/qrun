@@ -83,5 +83,19 @@
     "cooccur_half_life_days": 30,
     "jev_events": 20
   },
+  "history": {
+    "archive_after_minutes": 10,
+    "retention_days": 60
+  },
+  "redact": {
+    "clip_chars": 200,
+    "keywords": [
+      "password", "passwd", "pwd", "pass", "token", "secret", "api_key", "api-key", "apikey", "access_key",
+      "access-key", "private_key", "key", "auth", "authorization", "credential", "密码", "口令", "令牌", "密钥", "秘钥"
+    ],
+    "min_secret_len": 16,
+    "min_digit_switches": 3,
+    "entropy_ratio": 0.8
+  },
   "installer_app_id": "{98983307-BC2C-4CD7-BBFD-3CC28C3F50A5}"
 }

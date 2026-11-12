@@ -138,7 +138,7 @@ pub(super) fn tokens(timeline: &Timeline, now: i64) -> Vec<String> {
             What::Started { program } => format!("started {}", path(program)),
             What::Exited { program } => format!("exited {}", path(program)),
             What::Listen { program, .. } => format!("listen {}", path(program)),
-            What::Clipboard { content } => format!("clipboard {content}"),
+            What::Clipboard { content, .. } => format!("clipboard {content}"),
             What::Launch { target } => format!("launch {}", path(target)),
             What::Away => "back from away".to_string(),
             _ => continue,

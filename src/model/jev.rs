@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
+use crate::model::redact::redact;
 use crate::params::PARAMS;
 
 /// 准备发出的请求; options 是选项名到候选比较键的对应, 读应答时用.
@@ -44,7 +45,7 @@ pub fn request(draft: Draft) -> Request {
         options.push((option, candidate.key.clone()));
     }
     if let Some(query) = &query {
-        context.insert("search_query".into(), json!(query));
+        context.insert("search_query".into(), json!(redact(query).text));
     }
     let instructions = match query {
         Some(_) => "The user typed search_query into the launcher's search box. Which candidate do they want to open?",

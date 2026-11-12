@@ -197,9 +197,11 @@ impl Panel {
     /// 后台读系统最近记录, 读完显示到推荐页, 并交给 library 当候选, 新的打开记进启动记录供预测学习.
     /// 第一次读完时补记启动时那次打开.
     fn refresh_recent(&mut self, cx: &mut Context<Self>) {
-        let new_since = new_file_since();
+        let collect = self.settings.read(cx).smart.collect;
+        let new_since = collect.new_files.then(new_file_since);
         self.read_recent = cx.spawn(async move |this, cx| {
-            let recent = cx.background_executor().spawn(async move { recent::read(new_since) }).await;
+            let recent =
+                cx.background_executor().spawn(async move { recent::read(collect.system_recent, new_since) }).await;
             this.update(cx, |this, cx| {
                 let lists = [
                     (&recent.files, "file"),

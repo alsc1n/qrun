@@ -46,8 +46,16 @@ struct Section {
 impl Panel {
     pub(super) fn render_smart(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let smart = &self.settings.read(cx).smart;
-        let counts = [smart.predict, smart.frequent, smart.recent_files, smart.recent_folders, smart.recent_programs]
-            .map(|n| n as usize);
+        // 收集里关掉了系统最近记录时, 最近文件, 文件夹, 程序三块不显示
+        let system = smart.collect.system_recent as u32;
+        let counts = [
+            smart.predict,
+            smart.frequent,
+            smart.recent_files * system,
+            smart.recent_folders * system,
+            smart.recent_programs * system,
+        ]
+        .map(|n| n as usize);
         let items: HashMap<String, Item> = self
             .library
             .read(cx)
