@@ -1,21 +1,21 @@
 //! 推荐页的候选和学习: 每次打开 QRun 记下情境, 拆成标签 (`tags`), 给分组里的项目, 系统最近记录, 最近碰过的目标
 //! 按 `model::brain` 打分排好; 从 QRun 启动时按这次摆出的候选学一次对错, 并给标签账记一笔; 呼出后从别处打开的也记账.
-//! 给 Jev 拼请求.
+//! 给 Jev 拼请求 (附上本地账里的习惯); Jev 的归类标签并进这次的情境, 用户打开了什么就按它在 Jev 排序里的名次考核 Jev.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gpui_kit::Context;
 use rusqlite::{Connection, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::activity::{self, Recent};
 use super::tags::{self, StateInput};
 use super::{Item, Library, NEW_FILE, now_ms, week_minute};
-use crate::model::brain::{self, Candidate, FEATURES, Features, SKIPPED, Sample, Snapshot, Weights};
-use crate::model::jev;
-use crate::model::predict;
+use crate::model::brain::{self, Candidate, Entry, FEATURES, Features, Ledger, SKIPPED, Sample, Snapshot, Weights};
+use crate::model::jev::{self, Answer};
+use crate::model::predict::{self, Model};
 use crate::params::PARAMS;
 use crate::storage;
 
@@ -23,6 +23,15 @@ const MINUTE: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+/// Jev 归类得到的情境标签的前缀.
+const JEV_TAG: &str = "jev:";
+
+/// 一次打开时 Jev 的应答, 存在 opens.jev 里, 回放用: 归类标签, 候选按 Jev 给的概率从高到低 (考核用).
+#[derive(Serialize, Deserialize)]
+pub(super) struct JevRecord {
+    pub(super) tags: Vec<String>,
+    pub(super) ranking: Vec<String>,
+}
 
 /// 打开 QRun 那一刻的情境, 由界面从系统读好传进来; 拿不到的项为 None 或空. 标题已脱敏.
 #[derive(Clone, Default)]
@@ -111,20 +120,22 @@ pub(super) struct Open {
     outside_learned: bool,
     /// "猜你要打开"摆出了前几个.
     shown: usize,
-    /// 这次有没有用上 Jev 的结果.
+    /// 这次有没有用上 Jev 的结果排序.
     with_jev: bool,
+    /// Jev 对这次打开的排序; 结果晚到没用上时也有, 用户打开了什么都拿它考核 Jev.
+    jev_ranking: Option<Vec<String>>,
     /// 候选是什么时候排的; 沿用上次排序时也沿用它, 否则一直不换窗口就永远不重排.
     ranked_at: i64,
 }
 
 impl Library {
-    /// 打开了 QRun: 记下情境, 排好候选, 记下摆出的前 shown 个. jev 是预取好的概率 (调用方确认前台程序没变且不过旧),
+    /// 打开了 QRun: 记下情境, 排好候选, 记下摆出的前 shown 个. jev 是预取好的应答 (调用方确认前台程序没变且不过旧),
     /// 没有时只按本地排, 结果到了再 `apply_jev`. keep_order 时沿用上次排好的候选 (调用方先用 `order_still_fresh` 确认).
     pub fn begin_open(
         &mut self,
         situation: Situation,
         shown: usize,
-        jev: Option<&HashMap<String, f64>>,
+        jev: Option<&Answer>,
         keep_order: bool,
         cx: &mut Context<Self>,
     ) {
@@ -153,13 +164,13 @@ impl Library {
             return;
         }
         let previous = self.open.take();
-        let kept = previous
-            .as_ref()
-            .filter(|_| keep_order)
-            .map(|open| (open.candidates.clone(), open.with_jev, open.ranked_at, clone_snapshot(&open.snapshot)));
-        let (candidates, with_jev, ranked_at, snapshot) = kept.unwrap_or_else(|| {
+        let kept = previous.as_ref().filter(|_| keep_order).map(|open| {
+            let snapshot = clone_snapshot(&open.snapshot);
+            (open.candidates.clone(), open.with_jev, open.jev_ranking.clone(), open.ranked_at, snapshot)
+        });
+        let (candidates, with_jev, jev_ranking, ranked_at, snapshot) = kept.unwrap_or_else(|| {
             let (candidates, snapshot) = self.candidates(&situation, gap, now, week_minute);
-            (candidates, false, now, snapshot)
+            (candidates, false, None, now, snapshot)
         });
         self.previous_open = previous;
         let mut open = Open {
@@ -173,10 +184,11 @@ impl Library {
             outside_learned: false,
             shown,
             with_jev,
+            jev_ranking,
             ranked_at,
         };
-        if let Some(probabilities) = jev {
-            open.apply_jev(probabilities, &self.weights);
+        if let Some(answer) = jev {
+            open.take_answer(answer, true, &self.model, &self.ledger, &self.weights);
         }
         self.write_shown(&open);
         self.open = Some(open);
@@ -201,12 +213,12 @@ impl Library {
         self.open.as_ref().map(|open| open.id)
     }
 
-    /// 这次打开补调的 Jev 结果及时到了, 按它重排.
-    pub fn apply_jev(&mut self, open_id: i64, probabilities: &HashMap<String, f64>, cx: &mut Context<Self>) {
+    /// 这次打开补调的 Jev 结果到了: 归类标签并进情境, 记下它的排序待考核; reorder (及时到了) 时按它重排.
+    pub fn apply_jev(&mut self, open_id: i64, answer: &Answer, reorder: bool, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_mut().filter(|open| open.id == open_id) else {
             return;
         };
-        open.apply_jev(probabilities, &self.weights);
+        open.take_answer(answer, reorder, &self.model, &self.ledger, &self.weights);
         let open = self.open.as_ref().expect("just updated");
         self.write_shown(open);
         cx.notify();
@@ -243,7 +255,7 @@ impl Library {
         };
         let (mut candidates, _) = self.candidates(&situation, gap, now, week_minute(&self.db, now));
         if let Some(probabilities) = jev {
-            rescore(&mut candidates, probabilities, &self.weights);
+            rescore(&mut candidates, probabilities, &self.weights, self.ledger.jev_trust(now));
             sort(&mut candidates);
         }
         let (matched, rest): (Vec<Ranked>, Vec<Ranked>) =
@@ -258,8 +270,8 @@ impl Library {
         let now = now_ms();
         let week_minute = week_minute(&self.db, now);
         let gap = self.minutes_since_last_open(now);
-        let (candidates, _) = self.candidates(situation, gap, now, week_minute);
-        self.jev_request(situation, gap, &candidates, None, now, week_minute)
+        let (candidates, snapshot) = self.candidates(situation, gap, now, week_minute);
+        self.jev_request(situation, gap, &candidates, &snapshot.tags, None, now, week_minute)
     }
 
     /// 这次打开 QRun 时的 Jev 请求 (补调或搜索): 用打开那一刻的情境和摆出的候选, 搜索时名称匹配的排前面.
@@ -272,15 +284,19 @@ impl Library {
             let query = query.to_lowercase();
             candidates.sort_by_key(|c| !c.name.to_lowercase().contains(&query));
         }
-        Some(self.jev_request(&open.situation, open.gap, &candidates, query, now, week_minute(&self.db, now)))
+        let tags = &open.snapshot.tags;
+        Some(self.jev_request(&open.situation, open.gap, &candidates, tags, query, now, week_minute(&self.db, now)))
     }
 
-    /// 给 Jev 的请求: 情境, 最近的启动, 习惯摘要, 候选 (已排好).
+    /// 给 Jev 的请求: 情境, 最近的启动, 习惯摘要, 本地排前 max_candidates 的候选 (各附这次情境标签下的习惯).
+    /// 不是搜索时同时问归类; 最近复制过且不是受保护的内容时才问剪贴板是什么.
+    #[allow(clippy::too_many_arguments)]
     fn jev_request(
         &self,
         situation: &Situation,
         gap: Option<i64>,
         candidates: &[Ranked],
+        tags: &[String],
         query: Option<&str>,
         now: i64,
         week_minute: u16,
@@ -325,6 +341,7 @@ impl Library {
         }
         let candidates: Vec<jev::Candidate> = order
             .into_iter()
+            .take(PARAMS.jev.max_candidates)
             .map(|(rank, c)| {
                 let mut details = Map::new();
                 details.insert("type".into(), json!(c.kind));
@@ -343,10 +360,22 @@ impl Library {
                 }
                 details.insert("running".into(), json!(c.states.contains(&"自己:运行中")));
                 details.insert("name_in_window_title".into(), json!(c.states.contains(&"自己:在标题里")));
+                let habits: Vec<Value> = self
+                    .ledger
+                    .evidence(tags, &c.key, now)
+                    .into_iter()
+                    .map(|(tag, opened, seen)| json!({ "signal": tag, "opened_it": tenths(opened), "signal_seen": tenths(seen) }))
+                    .collect();
+                if !habits.is_empty() {
+                    details.insert("habits_in_this_situation".into(), json!(habits));
+                }
                 jev::Candidate { key: c.key.clone(), name: c.name.clone(), details: Value::Object(details) }
             })
             .collect();
-        jev::Draft { context, candidates, query: query.map(str::to_string) }
+        let classify = query.is_none();
+        let ask_clip =
+            classify && tags.iter().any(|t| t.starts_with("clip:")) && !tags.iter().any(|t| t == "clip:受保护");
+        jev::Draft { context, candidates, query: query.map(str::to_string), classify, ask_clip }
     }
 
     /// 从 QRun 打开了 key: 给标签账记一笔 (这次打开里第一次开东西时, 摆出的候选的状态也记); 再按摆出的候选学一次对错,
@@ -358,7 +387,13 @@ impl Library {
         let sample = if open.launched.is_empty() && !open.outside_learned { Sample::First } else { Sample::More };
         open.launched.insert(key.to_string());
         let open = self.open.as_ref().expect("just updated");
+        let trust = self.ledger.jev_trust(open.at);
         self.ledger.learn(&open.snapshot, key, 1., sample);
+        if let Some(ranking) = open.jev_ranking.as_ref().filter(|_| sample == Sample::First) {
+            self.ledger.judge_jev(ranking, key, at);
+        }
+        self.save_ledger();
+        let open = self.open.as_ref().expect("just updated");
 
         let shown = open.shown.min(open.candidates.len());
         // 打开后在设置里调大了"猜你要打开"的数量时, 点的名次可能超出当时记下的范围, 按没摆出来算
@@ -374,15 +409,17 @@ impl Library {
         if skipped.is_empty() {
             return;
         }
-        let mut chosen_features = match open.candidates.iter().find(|c| c.key == key) {
+        let chosen_features = match open.candidates.iter().find(|c| c.key == key) {
             Some(c) => c.features,
-            None => self.single_features(&open.snapshot, key, at),
+            None => {
+                let mut x = self.single_features(&open.snapshot, key, at);
+                if open.with_jev {
+                    // 不在候选里的 Jev 没见过, 概率按 0 算, 与 rescore 一致
+                    brain::set_jev(&mut x, 0., trust);
+                }
+                x
+            }
         };
-        if open.with_jev {
-            // 被点的不在 Jev 的候选里时它的概率按 0 算, 与 apply_jev 一致
-            let jev = open.candidates.iter().find(|c| c.key == key).and_then(|c| c.jev).unwrap_or(0.);
-            brain::set_jev(&mut chosen_features, jev);
-        }
         let mut rows: Vec<Features> = skipped.iter().map(|c| c.features).collect();
         rows.push(chosen_features);
         shares.push(1.);
@@ -408,7 +445,32 @@ impl Library {
         };
         open.outside_learned = true;
         self.ledger.learn(&open.snapshot, key, 1., Sample::First);
+        if let Some(ranking) = &open.jev_ranking {
+            self.ledger.judge_jev(ranking, key, at);
+        }
+        self.save_ledger();
         log::debug!("learned outside open of {key}");
+    }
+
+    /// 账里变了的各笔写进库.
+    pub(super) fn save_ledger(&mut self) {
+        let entries = self.ledger.take_changed();
+        let result = (|| -> rusqlite::Result<()> {
+            let tx = self.db.unchecked_transaction()?;
+            {
+                let mut upsert = tx.prepare(
+                    "INSERT INTO ledger (book, tag, target, count, at) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (book, tag, target) DO UPDATE SET count = excluded.count, at = excluded.at",
+                )?;
+                for e in &entries {
+                    upsert.execute(params![e.book, e.tag, e.target, e.count, e.at])?;
+                }
+            }
+            tx.commit()
+        })();
+        if let Err(e) = result {
+            storage::db_save_failed(&e);
+        }
     }
 
     /// 不在候选里的目标 (如在分组里另点的, 时间线还没碰过的) 在这次情境下的特征: 没有状态, 没被跳过.
@@ -554,6 +616,12 @@ impl Library {
                     insert.execute(params![open.id, rank, c.target.to_string_lossy(), c.score, c.jev])?;
                 }
             }
+            if let Some(ranking) = &open.jev_ranking {
+                let tags = open.snapshot.tags.iter().filter(|t| t.starts_with(JEV_TAG)).cloned().collect();
+                let record = JevRecord { tags, ranking: ranking.clone() };
+                let record = serde_json::to_string(&record).expect("serialize Jev record");
+                tx.execute("UPDATE opens SET jev = ?1 WHERE id = ?2", params![record, open.id])?;
+            }
             tx.commit()
         })();
         if let Err(e) = result {
@@ -599,11 +667,25 @@ pub struct HitRate {
 }
 
 impl Open {
-    /// 填上 Jev 的概率重新打分; 不在 Jev 候选里的 (请求超长时去掉的排名靠后的) 按 0 算.
-    fn apply_jev(&mut self, probabilities: &HashMap<String, f64>, weights: &Weights) {
-        rescore(&mut self.candidates, probabilities, weights);
-        self.with_jev = true;
-        sort(&mut self.candidates);
+    /// Jev 的应答到了: 归类标签并进情境 (记账时一起记, 情境一项随之重算), 记下它的排序 (之后用户打开了什么就考核它).
+    /// reorder 时填上 Jev 的概率 (乘信任) 重新打分排序, 不在 Jev 候选里的按 0 算; 否则已经摆出来了, 顺序不动.
+    fn take_answer(&mut self, answer: &Answer, reorder: bool, model: &Model, ledger: &Ledger, weights: &Weights) {
+        for tag in &answer.tags {
+            if !self.snapshot.tags.contains(tag) {
+                self.snapshot.tags.push(tag.clone());
+            }
+        }
+        self.jev_ranking = Some(answer.ranking());
+        let keys = self.snapshot.candidates.iter().map(|c| c.key.as_str());
+        let features: HashMap<&str, Features> = keys.zip(brain::features(model, ledger, &self.snapshot)).collect();
+        for c in &mut self.candidates {
+            c.features = features[c.key.as_str()];
+        }
+        if reorder {
+            rescore(&mut self.candidates, &answer.probabilities, weights, ledger.jev_trust(self.at));
+            self.with_jev = true;
+            sort(&mut self.candidates);
+        }
     }
 }
 
@@ -628,6 +710,17 @@ pub(super) fn skip_counts<'a>(rows: impl IntoIterator<Item = (&'a str, i64)>, no
         *counts.entry(predict::key(Path::new(target))).or_insert(0.) += (-((now - at) as f64) / DAY as f64).exp();
     }
     counts
+}
+
+/// 库里存的标签账.
+pub(super) fn read_ledger(db: &Connection) -> rusqlite::Result<Ledger> {
+    let entries = db
+        .prepare("SELECT book, tag, target, count, at FROM ledger")?
+        .query_map([], |row| {
+            Ok(Entry { book: row.get(0)?, tag: row.get(1)?, target: row.get(2)?, count: row.get(3)?, at: row.get(4)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Ledger::from_entries(entries))
 }
 
 /// 库里学到的权重; 没学过的特征用初始值.
@@ -670,13 +763,18 @@ fn clone_snapshot(snapshot: &Snapshot) -> Snapshot {
     }
 }
 
-fn rescore(candidates: &mut [Ranked], probabilities: &HashMap<String, f64>, weights: &Weights) {
+fn rescore(candidates: &mut [Ranked], probabilities: &HashMap<String, f64>, weights: &Weights, trust: f64) {
     for c in candidates {
         let p = probabilities.get(&c.key).copied().unwrap_or(0.);
         c.jev = Some(p);
-        brain::set_jev(&mut c.features, p);
+        brain::set_jev(&mut c.features, p, trust);
         c.score = weights.score(&c.features, true);
     }
+}
+
+/// 保留一位小数, 给 Jev 看的次数.
+fn tenths(x: f64) -> f64 {
+    (x * 10.).round() / 10.
 }
 
 fn sort(candidates: &mut [Ranked]) {

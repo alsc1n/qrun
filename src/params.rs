@@ -60,7 +60,7 @@ pub struct Predict {
     pub replay_days: i64,
     /// 回放时进前几名算命中.
     pub replay_top_k: usize,
-    /// 每隔多久重新回放调参一次.
+    /// 每隔多久重新调一次程序本身统计的参数.
     pub replay_interval_hours: u64,
 }
 
@@ -71,10 +71,9 @@ pub struct Learn {
     pub rate: f64,
     /// 往起步权重回拉的强度, 算在每次学习的梯度里: 权重偏离起步值 1 时, 回拉相当于 l2 那么大的反向梯度.
     pub l2: f64,
-    /// Jev 一项的起步权重和学习时的下限.
+    /// Jev 一项的起步权重; 实际分量还要乘 Jev 的信任 (jev.trust_*).
     pub jev_initial: f64,
-    pub jev_floor: f64,
-    /// 记录类特征 (程序本身的四项, 情境, 状态, 见 model::brain::SKIPPED 之前) 权重学习时的下限.
+    /// 记录类特征 (程序本身的四项, 情境, 状态, 见 model::brain::SKIPPED 之前) 和 Jev 权重学习时的下限.
     pub evidence_floor: f64,
     /// Jev 特征取 ln(p + 这个值): p 为 0 时不至于一票否决.
     pub jev_smoothing: f64,
@@ -105,8 +104,23 @@ pub struct Jev {
     pub base_url: String,
     pub model: String,
     pub timeout_secs: u32,
-    /// 一次最多让 Jev 在多少个候选里选 (接口上限 255).
+    /// 一次让 Jev 在本地排前多少个候选里排 (接口上限 255); 范围小 Jev 才判得准, 新文件不受本地名次限制排在前面.
     pub max_candidates: usize,
+    /// 每个候选附上本地账里 "出现这个情境标签时开过它几次" 最多的几条, 让 Jev 按用户自己的习惯判断.
+    pub evidence_tags: usize,
+    /// 开过至少这么多次 (按半衰期衰减后) 才算一条习惯.
+    pub evidence_min: f64,
+    /// 归类问题 (剪贴板是什么, 用户在做什么) 的答案概率至少这么高才记成标签.
+    pub tag_min_probability: f64,
+    /// 归类问题的选项, 也是标签值 (jev:剪贴板:xx, jev:在做:xx).
+    pub clip_kinds: Vec<String>,
+    pub doings: Vec<String>,
+    /// 考核 Jev: 用户打开的在 Jev 排序里第一得 1 分, 每往后一名乘这个数, 不在它排的里面得 0 分.
+    pub rank_decay: f64,
+    /// Jev 的信任 = 历次得分的平均 (按 ledger.half_life_days 衰减), 向 trust_prior 平滑, 强度相当于 trust_smoothing 次考核.
+    /// Jev 一项的分量乘信任: 排得准分量大, 排不准就少听它的.
+    pub trust_prior: f64,
+    pub trust_smoothing: f64,
     /// state 序列化后的字节上限; 超过约 32000 字节 Jev 会切到更慢更不准的长上下文模式.
     pub max_state_bytes: usize,
     /// 带上最近多少次启动.

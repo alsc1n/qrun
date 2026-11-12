@@ -1,6 +1,7 @@
 //! 回放: 按时间顺序把库里的历史 (启动记录, 每次打开时的情境, 归档的活动时间线, 跳过记录) 重新喂给一个空的模型,
 //! 每次打开 QRun 时用它排序, 看实际打开的目标排第几, 然后照常学习. 和线上走同一套打分和记账 (`model::brain`),
-//! 量出的就是线上效果; 跑完得到的账和权重就是用全部历史从零练出来的, 后台定时用它换掉在线学到的.
+//! 量出的就是线上效果. 库里还没有账时 (升级上来, 或迁移清掉了) 用它从历史建一次账和权重, 之后在线一直累积;
+//! 平时只是开发时对比效果的工具 (`qrun.exe --replay`).
 //!
 //! 答案: 这次打开里从 QRun 点开的第一个; 没有时, 呼出后 outside_minutes 内 (且在下次呼出前) 从别处打开的第一个
 //! (系统最近记录里的文件, 文件夹, 用户自己开的程序). 对比的 "当时" 是那次实际摆出的名次 (shown 表).
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use super::activity::{self, Recent};
-use super::smart::{self, Situation, Window};
+use super::smart::{self, JevRecord, Situation, Window};
 use super::tags::{self, StateInput};
 use super::timeline::{Event, Timeline, What};
 use super::{Group, Library, read_groups, read_launches};
@@ -56,6 +57,9 @@ pub struct Report {
     /// 从 QRun 打开的目标根本不在候选里 (排不上, 怎么改打分也猜不中).
     missing: usize,
     outside: Hits,
+    /// 考核 Jev: 得分之和, 次数 (见 `brain::jev_credit`).
+    jev_credit: f64,
+    jev_judged: usize,
 }
 
 /// 一组打开里答案排第一, 进前 k 的次数; online 是当时实际摆出的.
@@ -99,8 +103,15 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{} 次打开. 从 QRun 打开, 当时没用 Jev: {}; 当时用了 Jev: {}; 不在候选里 {}. 呼出后从别处打开: {}.",
-            self.opens, self.without_jev, self.with_jev, self.missing, self.outside
+            "{} 次打开. 从 QRun 打开, 当时没用 Jev: {}; 当时用了 Jev: {}; 不在候选里 {}. 呼出后从别处打开: {}. \
+             Jev 排序得分 {:.2} ({} 次).",
+            self.opens,
+            self.without_jev,
+            self.with_jev,
+            self.missing,
+            self.outside,
+            if self.jev_judged == 0 { 0. } else { self.jev_credit / self.jev_judged as f64 },
+            self.jev_judged
         )
     }
 }
@@ -123,6 +134,8 @@ struct OpenRow {
     gap: Option<i64>,
     /// 归档之前的打开存下的最近活动.
     recent: Option<String>,
+    /// 当时 Jev 的应答 (库 13 版之后才有).
+    jev: Option<JevRecord>,
 }
 
 pub(super) fn run(
@@ -142,7 +155,10 @@ pub(super) fn run(
         })?
         .collect::<rusqlite::Result<_>>()?;
     let opens: Vec<OpenRow> = db
-        .prepare("SELECT id, at, week_minute, foreground, title, gap_minutes, clipboard, windows, recent FROM opens ORDER BY at")?
+        .prepare(
+            "SELECT id, at, week_minute, foreground, title, gap_minutes, clipboard, windows, recent, jev
+             FROM opens ORDER BY at",
+        )?
         .query_map([], |row| {
             let windows: Option<String> = row.get(7)?;
             Ok(OpenRow {
@@ -159,6 +175,9 @@ pub(super) fn run(
                 },
                 gap: row.get(5)?,
                 recent: row.get(8)?,
+                jev: row
+                    .get::<_, Option<String>>(9)?
+                    .map(|json| serde_json::from_str(&json).expect("opens.jev 是 Jev 应答记录")),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -174,17 +193,27 @@ pub(super) fn run(
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut shown: HashMap<i64, Vec<String>> = HashMap::new();
-    let mut with_jev: HashSet<i64> = HashSet::new();
+    // 摆出的候选里 Jev 给的概率; 库 13 版之前没存 Jev 的完整排序, 用它近似
+    let mut shown_jev: HashMap<i64, Vec<(String, f64)>> = HashMap::new();
     let mut rows = db.prepare("SELECT open_id, target, jev FROM shown ORDER BY open_id, rank")?;
     let rows =
         rows.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<f64>>(2)?)))?;
     for row in rows {
         let (open, target, jev) = row?;
-        shown.entry(open).or_default().push(predict::key(Path::new(&target)));
-        if jev.is_some() {
-            with_jev.insert(open);
+        let key = predict::key(Path::new(&target));
+        if let Some(p) = jev {
+            shown_jev.entry(open).or_default().push((key.clone(), p));
         }
+        shown.entry(open).or_default().push(key);
     }
+    let jev_ranking = |open: &OpenRow| -> Option<Vec<String>> {
+        if let Some(record) = &open.jev {
+            return Some(record.ranking.clone());
+        }
+        let mut list = shown_jev.get(&open.id)?.clone();
+        list.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Some(list.into_iter().map(|(key, _)| key).collect())
+    };
 
     // 每次打开里从 QRun 点开的, 按先后
     let mut clicks: HashMap<i64, Vec<&str>> = HashMap::new();
@@ -246,7 +275,14 @@ pub(super) fn run(
         } else {
             &timeline
         };
-        let snapshot = snapshot(items, &opened, at_open, open, &recent_skips);
+        let mut snapshot = snapshot(items, &opened, at_open, open, &recent_skips);
+        // Jev 的归类标签和线上一样并进情境
+        for tag in open.jev.iter().flat_map(|record| &record.tags) {
+            if !snapshot.tags.contains(tag) {
+                snapshot.tags.push(tag.clone());
+            }
+        }
+        let ranking = jev_ranking(open);
         let features = brain::features(&model, &ledger, &snapshot);
         let mut order: Vec<usize> = (0..features.len()).collect();
         order.sort_by(|&a, &b| weights.score(&features[b], false).total_cmp(&weights.score(&features[a], false)));
@@ -258,12 +294,17 @@ pub(super) fn run(
             let rank = rank_of(first);
             let online = shown.get(&open.id).and_then(|list| list.iter().position(|k| k == first));
             report.missing += rank.is_none() as usize;
-            match with_jev.contains(&open.id) {
+            match shown_jev.contains_key(&open.id) {
                 true => report.with_jev.add(rank, online),
                 false => report.without_jev.add(rank, online),
             }
 
             ledger.learn(&snapshot, first, 1., Sample::First);
+            if let Some(ranking) = &ranking {
+                ledger.judge_jev(ranking, first, open.at);
+                report.jev_credit += brain::jev_credit(ranking, first);
+                report.jev_judged += 1;
+            }
             for key in &clicked[1..] {
                 ledger.learn(&snapshot, key, 1., Sample::More);
             }
@@ -289,6 +330,11 @@ pub(super) fn run(
         {
             report.outside.add(rank_of(key), None);
             ledger.learn(&snapshot, key, 1., Sample::First);
+            if let Some(ranking) = &ranking {
+                ledger.judge_jev(ranking, key, open.at);
+                report.jev_credit += brain::jev_credit(ranking, key);
+                report.jev_judged += 1;
+            }
         }
     }
     Ok((ledger, weights, report))

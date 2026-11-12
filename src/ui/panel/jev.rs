@@ -1,7 +1,8 @@
 //! 打开面板时记一次打开, 以及 Jev 的调用时机: 前台窗口或它的标题停稳 prefetch_delay_ms 后预取, 都没变时每 refresh_minutes
 //! 刷新; 两次预取至少隔 prefetch_min_interval_seconds, 人离开 (idle_minutes 没有输入) 时不预取.
 //! 打开面板时预取结果是同一窗口同一标题且不过旧就直接用, 否则补调. 补调结果在打开后 reorder_window_ms 内且鼠标还没进推荐页
-//! 才用上, 晚到的这次打开不用, 排序和学习都按本地分, 同一情境不会时而按 Jev 时而不按. 搜索框停止输入 search_debounce_ms 后按搜索词调一次.
+//! 才用来排序, 晚到的这次打开不重排, 同一情境不会时而按 Jev 时而不按; 晚到的归类标签和排序仍记下 (记账, 考核 Jev).
+//! 搜索框停止输入 search_debounce_ms 后按搜索词调一次.
 //! 每次调用的结果记进 Library, 设置页显示最近一次.
 
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ use gpui_kit::*;
 use windows::Win32::Foundation::HWND;
 
 use super::Panel;
-use crate::model::jev;
+use crate::model::jev::{self, Answer};
 use crate::model::library::{self, NEW_FILE, Observed, Situation};
 use crate::model::redact::redact;
 use crate::params::PARAMS;
@@ -32,7 +33,7 @@ struct Prefetched {
     /// 结果到的时间.
     at: Instant,
     /// 失败为 None, 到刷新时间再试.
-    probabilities: Option<Probabilities>,
+    answer: Option<Answer>,
 }
 
 pub(super) struct JevState {
@@ -117,7 +118,7 @@ impl Panel {
             .prefetched
             .as_ref()
             .filter(|p| Some(&p.watched) == external.as_ref() && p.at.elapsed() < minutes(PARAMS.jev.stale_minutes))
-            .and_then(|p| p.probabilities.clone());
+            .and_then(|p| p.answer.clone());
         let situation = self.situation(cx);
         let shown = self.settings.read(cx).smart.predict as usize;
         self.library.update(cx, |lib, cx| {
@@ -134,16 +135,14 @@ impl Panel {
         self.jev.open_fetch = cx.spawn(async move |this, cx| {
             let result = ask.await;
             this.update(cx, |this, cx| {
-                let Some(probabilities) = this.jev_answered(result, cx) else {
+                let Some(answer) = this.jev_answered(result, cx) else {
                     return;
                 };
                 let window = Duration::from_millis(PARAMS.jev.reorder_window_ms);
-                if !this.jev.smart_entered && this.jev.opened_at.is_some_and(|at| at.elapsed() < window) {
-                    this.library.update(cx, |lib, cx| lib.apply_jev(open_id, &probabilities, cx));
-                }
+                let reorder = !this.jev.smart_entered && this.jev.opened_at.is_some_and(|at| at.elapsed() < window);
+                this.library.update(cx, |lib, cx| lib.apply_jev(open_id, &answer, reorder, cx));
                 if let Some(watched) = external {
-                    this.jev.prefetched =
-                        Some(Prefetched { watched, at: Instant::now(), probabilities: Some(probabilities) });
+                    this.jev.prefetched = Some(Prefetched { watched, at: Instant::now(), answer: Some(answer) });
                 }
             })
             .ok();
@@ -185,9 +184,9 @@ impl Panel {
         self.jev.prefetch = Some(cx.spawn(async move |this, cx| {
             let result = ask.await;
             this.update(cx, |this, cx| {
-                let probabilities = this.jev_answered(result, cx);
+                let answer = this.jev_answered(result, cx);
                 this.jev.prefetch = None;
-                this.jev.prefetched = Some(Prefetched { watched, at: Instant::now(), probabilities });
+                this.jev.prefetched = Some(Prefetched { watched, at: Instant::now(), answer });
             })
             .ok();
         }));
@@ -227,8 +226,8 @@ impl Panel {
             };
             let result = ask.await;
             this.update(cx, |this, cx| {
-                if let Some(probabilities) = this.jev_answered(result, cx) {
-                    this.jev.search = Some((query, probabilities));
+                if let Some(answer) = this.jev_answered(result, cx) {
+                    this.jev.search = Some((query, answer.probabilities));
                     this.refresh_search(cx);
                 }
             })
@@ -260,7 +259,7 @@ impl Panel {
     }
 
     /// 后台组请求并调 Jev.
-    fn ask_jev(&self, draft: jev::Draft, cx: &App) -> Task<Result<Probabilities, String>> {
+    fn ask_jev(&self, draft: jev::Draft, cx: &App) -> Task<Result<Answer, String>> {
         let smart = &self.settings.read(cx).smart;
         let (url, key) = (smart.jev_url(), smart.jev_key.clone());
         cx.background_executor().spawn(async move {
@@ -270,8 +269,8 @@ impl Panel {
         })
     }
 
-    /// 记下 Jev 这次的结果 (设置页显示, 失败写日志), 成功时返回概率.
-    fn jev_answered(&self, result: Result<Probabilities, String>, cx: &mut Context<Self>) -> Option<Probabilities> {
+    /// 记下 Jev 这次的结果 (设置页显示, 失败写日志), 成功时返回应答.
+    fn jev_answered(&self, result: Result<Answer, String>, cx: &mut Context<Self>) -> Option<Answer> {
         let status = result.as_ref().map(|_| ()).map_err(String::clone);
         self.library.update(cx, |lib, cx| lib.record_jev(platform::local_time(), status, cx));
         result.ok()

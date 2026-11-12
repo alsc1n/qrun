@@ -29,7 +29,7 @@ pub use smart::{Ranked, Situation, Via, Window};
 pub use timeline::What;
 
 /// 库结构版本; 破坏性变更时加一, 并在 migrate 里加上从旧版本迁移的语句.
-const DB_VERSION: u32 = 12;
+const DB_VERSION: u32 = 14;
 const LEGACY_FILE: &str = "library.json";
 const LEGACY_VERSION: u32 = 1;
 
@@ -156,6 +156,22 @@ const SCHEMA_V12: &str = "
     DELETE FROM weights;
 ";
 
+/// 13: 每次打开时 Jev 的应答 (归类标签, 它认为最可能的目标), 回放时还原标签和考核 Jev 用.
+const SCHEMA_V13: &str = "ALTER TABLE opens ADD COLUMN jev TEXT;";
+
+/// 14: 标签账存库一直累积 (之前只在内存里, 每次启动由回放重建, 记录过了保留天数经验就丢了).
+/// 表是空的时 (就是这次升级) 启动后由回放从历史建一次. 以后改了算法旧账不能用时, 迁移里清空这张表即可重建.
+const SCHEMA_V14: &str = "
+    CREATE TABLE ledger (
+        book TEXT NOT NULL,
+        tag TEXT NOT NULL,
+        target TEXT NOT NULL,
+        count REAL NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (book, tag, target)
+    ) WITHOUT ROWID;
+";
+
 const INSERT_LAUNCH: &str = "INSERT INTO launches (item_id, target, at, source, week_minute, open_id, via, rank)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
@@ -170,7 +186,7 @@ pub struct Library {
     /// 全部启动记录 (含系统来源), 按时间排好, 预测从这里学.
     launches: Vec<Launch>,
     model: Model,
-    /// 标签账; 启动后由后台回放建出, 之后每次打开实时加.
+    /// 标签账, 从库里读出, 每次打开实时加并存库.
     ledger: Ledger,
     weights: Weights,
     /// 上次读到的系统最近记录和新文件, 推荐页的候选.
@@ -184,7 +200,7 @@ pub struct Library {
     /// 最近一段活动时间线.
     timeline: timeline::Timeline,
     db: Connection,
-    /// 定时回放 (调参, 建账, 重练权重) 的后台任务.
+    /// 定时调程序本身统计的参数 (库里还没有账时先回放建账) 的后台任务.
     tuning: Task<()>,
 }
 
@@ -307,6 +323,7 @@ impl Library {
         let clicks = read_clicks(&db).map_err(fail)?;
         let launches = read_launches(&db).map_err(fail)?;
         let weights = smart::read_weights(&db).map_err(fail)?;
+        let ledger = smart::read_ledger(&db).map_err(fail)?;
         let timeline = timeline::Timeline::read(&db).map_err(fail)?;
         let max_id = groups.iter().flat_map(|g| std::iter::once(g.id).chain(g.items.iter().map(|i| i.id))).max();
         let mut library = Self {
@@ -315,7 +332,7 @@ impl Library {
             clicks,
             model: Model::build(&launches, Tuning::initial()),
             launches,
-            ledger: Ledger::default(),
+            ledger,
             weights,
             system: Vec::new(),
             open: None,
@@ -374,37 +391,43 @@ impl Library {
         items.into_iter().take(n).map(|(i, _)| i.clone()).collect()
     }
 
-    /// 启动时和之后每隔 replay_interval_hours 在后台回放历史: 先调程序本身统计的参数, 再用全部历史从零建标签账,
-    /// 重练权重, 换掉在线学到的 (回放和在线是同一套算法, 用全部历史比一次次在线学更稳). 启动时这一轮跑完前账是空的,
-    /// 推荐只按程序本身的统计和权重排.
+    /// 启动时和之后每隔 replay_interval_hours 在后台调程序本身统计的参数 (半衰期, 钟点宽度; 从永久保留的启动记录算).
+    /// 库里还没有标签账时 (升级上来, 或迁移清掉了), 这一轮先用回放从历史建账和权重, 存进库; 之后账一直累积, 不再重建.
+    /// 建账期间点的不会记进账 (建好的账整个换上), 只有升级后第一次启动的几秒.
     pub fn start_tuning(&mut self, cx: &mut Context<Self>) {
         let interval = Duration::from_secs(PARAMS.predict.replay_interval_hours * 3600);
         self.tuning = cx.spawn(async move |this, cx| {
             loop {
-                let Ok((launches, items)) = this.read_with(cx, |lib, _| (lib.launches.clone(), replay::items(lib)))
-                else {
+                let Ok((launches, items)) = this.read_with(cx, |lib, _| {
+                    let build = lib.ledger.is_empty().then(|| replay::items(lib));
+                    (lib.launches.clone(), build)
+                }) else {
                     return;
                 };
-                let replayed = cx
+                let tuned = cx
                     .background_executor()
                     .spawn(async move {
                         let tuning = predict::tune(&launches, now_ms());
-                        (tuning, storage::open_db_read_only().and_then(|db| replay::run(&db, &items, tuning)))
+                        let built = items
+                            .map(|items| storage::open_db_read_only().and_then(|db| replay::run(&db, &items, tuning)));
+                        (tuning, built)
                     })
                     .await;
                 let updated = this.update(cx, |lib, _| {
-                    let (tuning, result) = replayed;
+                    let (tuning, built) = tuned;
                     lib.model = Model::build(&lib.launches, tuning);
-                    match result {
-                        Ok((ledger, weights, report)) => {
-                            log::info!("回放: {report}");
+                    match built {
+                        Some(Ok((ledger, weights, report))) => {
+                            log::info!("从历史建账: {report}");
                             lib.ledger = ledger;
                             lib.weights = weights;
+                            lib.save_ledger();
                             if let Err(e) = smart::write_weights(&lib.db, &lib.weights) {
                                 storage::db_save_failed(&e);
                             }
                         }
-                        Err(e) => log::warn!("回放失败: {e}"),
+                        Some(Err(e)) => log::warn!("从历史建账失败: {e}"),
+                        None => {}
                     }
                 });
                 if updated.is_err() {
@@ -828,6 +851,8 @@ fn migrate(from: u32, db: &Transaction) -> rusqlite::Result<()> {
         8 | 9 => redact_saved(db),
         10 => db.execute_batch(SCHEMA_V11),
         11 => db.execute_batch(SCHEMA_V12),
+        12 => db.execute_batch(SCHEMA_V13),
+        13 => db.execute_batch(SCHEMA_V14),
         _ => unreachable!("qrun.db 没有版本 {from} 的迁移"),
     }
 }
