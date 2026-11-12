@@ -119,7 +119,9 @@ impl Panel {
             .and_then(|p| p.probabilities.clone());
         let situation = self.situation();
         let shown = self.settings.read(cx).smart.predict as usize;
-        self.library.update(cx, |lib, cx| lib.begin_open(situation, shown, fresh.as_ref().filter(|_| !keep_order), keep_order, cx));
+        self.library.update(cx, |lib, cx| {
+            lib.begin_open(situation, shown, fresh.as_ref().filter(|_| !keep_order), keep_order, cx)
+        });
         if keep_order || fresh.is_some() || !self.settings.read(cx).smart.jev_on() {
             return;
         }

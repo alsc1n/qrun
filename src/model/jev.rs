@@ -56,7 +56,8 @@ pub fn request(draft: Draft) -> Request {
     };
     // 逐个试要序列化上百次; 体积随候选数单调增加, 二分找能放下的最多个数, 至少留一个
     let counts: Vec<usize> = (2..=options.len()).collect();
-    let fits = |n: &usize| body(&context, &candidates, &options[..*n], instructions).len() <= PARAMS.jev.max_state_bytes;
+    let fits =
+        |n: &usize| body(&context, &candidates, &options[..*n], instructions).len() <= PARAMS.jev.max_state_bytes;
     let count = options.len().min(1) + counts.partition_point(fits);
     options.truncate(count);
     Request { body: body(&context, &candidates, &options, instructions), options }
