@@ -1,5 +1,6 @@
-//! 推荐页的候选和学习: 每次打开 QRun 记下情境, 给分组里的项目和系统最近记录算特征和分数排好;
-//! 从 QRun 启动时按这次摆出的候选学一次对错; 给 Jev 拼请求.
+//! 推荐页的候选和学习: 每次打开 QRun 记下情境, 拆成标签 (`tags`), 给分组里的项目, 系统最近记录, 最近碰过的目标
+//! 按 `model::brain` 打分排好; 从 QRun 启动时按这次摆出的候选学一次对错, 并给标签账记一笔; 呼出后从别处打开的也记账.
+//! 给 Jev 拼请求.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,9 +11,11 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::activity::{self, Recent};
+use super::tags::{self, StateInput};
 use super::{Item, Library, NEW_FILE, now_ms, week_minute};
+use crate::model::brain::{self, Candidate, FEATURES, Features, SKIPPED, Sample, Snapshot, Weights};
 use crate::model::jev;
-use crate::model::predict::{self, FEATURES, Facets, Features, IN_TITLE, RUNNING, SKIPPED, Signals, Weights};
+use crate::model::predict;
 use crate::params::PARAMS;
 use crate::storage;
 
@@ -21,7 +24,7 @@ const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-/// 打开 QRun 那一刻的情境, 由界面从系统读好传进来; 拿不到的项为 None 或空.
+/// 打开 QRun 那一刻的情境, 由界面从系统读好传进来; 拿不到的项为 None 或空. 标题已脱敏.
 #[derive(Clone, Default)]
 pub struct Situation {
     /// 打开 QRun 前的前台程序.
@@ -33,7 +36,7 @@ pub struct Situation {
 }
 
 /// 一个开着的窗口; 程序读不到时为 None.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct Window {
     pub program: Option<PathBuf>,
     pub title: String,
@@ -86,6 +89,7 @@ pub struct Ranked {
     pub kind: &'static str,
     /// 系统记录的最后打开时间, 新文件是出现的时间.
     at: Option<i64>,
+    states: Vec<&'static str>,
     features: Features,
     jev: Option<f64>,
     score: f64,
@@ -94,21 +98,23 @@ pub struct Ranked {
 /// 一次打开 QRun.
 pub(super) struct Open {
     pub(super) id: i64,
+    at: i64,
     situation: Situation,
     /// 距上一次打开多少分钟; 这次打开之后再问 Jev 也要用它, 不能重新查 (最近一次就是这次).
     gap: Option<i64>,
-    pub(super) facets: Facets,
+    /// 情境标签和各候选的状态, 记账用.
+    snapshot: Snapshot,
     candidates: Vec<Ranked>,
     /// 这次打开里已经点过的目标 (比较键); 面板没收起时会接着点下一个, 它们不算被跳过.
     launched: HashSet<String>,
+    /// 呼出后从别处打开的已经记过账 (只记第一个).
+    outside_learned: bool,
     /// "猜你要打开"摆出了前几个.
     shown: usize,
     /// 这次有没有用上 Jev 的结果.
     with_jev: bool,
     /// 候选是什么时候排的; 沿用上次排序时也沿用它, 否则一直不换窗口就永远不重排.
     ranked_at: i64,
-    /// 打开前发生了哪些事 (`activity::tokens`), 点了什么就记进"出现这些事之后打开了什么".
-    pub(super) tokens: Vec<String>,
 }
 
 impl Library {
@@ -125,7 +131,6 @@ impl Library {
         let now = now_ms();
         let week_minute = week_minute(&self.db, now);
         let gap = self.minutes_since_last_open(now);
-        let facets = facets(&situation, gap);
         let windows = serde_json::to_string(&situation.windows).expect("serialize windows");
         let recent =
             serde_json::to_string(&self.timeline.recent(PARAMS.timeline.summary_events)).expect("serialize timeline");
@@ -147,24 +152,28 @@ impl Library {
             storage::db_save_failed(&e);
             return;
         }
-        let kept = self
-            .open
+        let previous = self.open.take();
+        let kept = previous
             .as_ref()
             .filter(|_| keep_order)
-            .map(|open| (open.candidates.clone(), open.with_jev, open.ranked_at));
-        let (candidates, with_jev, ranked_at) =
-            kept.unwrap_or_else(|| (self.candidates(&situation, &facets, now, week_minute), false, now));
+            .map(|open| (open.candidates.clone(), open.with_jev, open.ranked_at, clone_snapshot(&open.snapshot)));
+        let (candidates, with_jev, ranked_at, snapshot) = kept.unwrap_or_else(|| {
+            let (candidates, snapshot) = self.candidates(&situation, gap, now, week_minute);
+            (candidates, false, now, snapshot)
+        });
+        self.previous_open = previous;
         let mut open = Open {
             id: self.db.last_insert_rowid(),
+            at: now,
             situation,
             gap,
-            facets,
+            snapshot,
             candidates,
             launched: HashSet::new(),
+            outside_learned: false,
             shown,
             with_jev,
             ranked_at,
-            tokens: activity::tokens(&self.timeline, now),
         };
         if let Some(probabilities) = jev {
             open.apply_jev(probabilities, &self.weights);
@@ -184,6 +193,7 @@ impl Library {
     /// 关掉推荐: 丢掉这次打开, 之后的启动不再学习, 也不挂情境.
     pub fn end_open(&mut self, cx: &mut Context<Self>) {
         self.open = None;
+        self.previous_open = None;
         cx.notify();
     }
 
@@ -226,12 +236,12 @@ impl Library {
     pub fn search(&self, query: &str, jev: Option<&HashMap<String, f64>>) -> (Vec<Item>, Vec<Ranked>) {
         let query = query.to_lowercase();
         let now = now_ms();
-        // 搜索是这次打开里的事, 情境 (标题, 正在运行等) 和推荐页一样按打开那一刻算, 学到的权重才对得上
-        let (situation, facets) = match &self.open {
-            Some(open) => (open.situation.clone(), open.facets.clone()),
-            None => (Situation::default(), Facets::default()),
+        // 搜索是这次打开里的事, 情境 (标题, 正在运行等) 和推荐页一样按打开那一刻算, 学到的账才对得上
+        let (situation, gap) = match &self.open {
+            Some(open) => (open.situation.clone(), open.gap),
+            None => (Situation::default(), None),
         };
-        let mut candidates = self.candidates(&situation, &facets, now, week_minute(&self.db, now));
+        let (mut candidates, _) = self.candidates(&situation, gap, now, week_minute(&self.db, now));
         if let Some(probabilities) = jev {
             rescore(&mut candidates, probabilities, &self.weights);
             sort(&mut candidates);
@@ -248,7 +258,7 @@ impl Library {
         let now = now_ms();
         let week_minute = week_minute(&self.db, now);
         let gap = self.minutes_since_last_open(now);
-        let candidates = self.candidates(situation, &facets(situation, gap), now, week_minute);
+        let (candidates, _) = self.candidates(situation, gap, now, week_minute);
         self.jev_request(situation, gap, &candidates, None, now, week_minute)
     }
 
@@ -331,64 +341,52 @@ impl Library {
                 if c.features[SKIPPED] > 0. {
                     details.insert("times_skipped_recently".into(), json!((c.features[SKIPPED] * 10.).round() / 10.));
                 }
-                details.insert("running".into(), json!(c.features[RUNNING] > 0.));
-                details.insert("name_in_window_title".into(), json!(c.features[IN_TITLE] > 0.));
+                details.insert("running".into(), json!(c.states.contains(&"自己:运行中")));
+                details.insert("name_in_window_title".into(), json!(c.states.contains(&"自己:在标题里")));
                 jev::Candidate { key: c.key.clone(), name: c.name.clone(), details: Value::Object(details) }
             })
             .collect();
         jev::Draft { context, candidates, query: query.map(str::to_string) }
     }
 
-    /// 按这次打开时摆出的候选学一次对错, 只把多半被看到了的算作被跳过:
-    /// 被点的摆在"猜你要打开"里 (不论从哪点的): 它上面最近的 skip_window 个, 离得越远分量越小;
-    /// 没摆出来的 (在分组或搜索里另点了别的): "猜你要打开"的前 elsewhere_skipped 个; 推荐里没有才去别处点, 这是推荐失算, 要学.
-    /// 这次打开里之前点过的不算被跳过.
+    /// 从 QRun 打开了 key: 给标签账记一笔 (这次打开里第一次开东西时, 摆出的候选的状态也记); 再按摆出的候选学一次对错,
+    /// 只把多半被看到了的算作被跳过 (见 `skipped_shares`). 这次打开里之前点过的不算被跳过.
     pub(super) fn learn(&mut self, key: &str, target: &Path, via: Via, at: i64) {
-        let Some(open) = &mut self.open else {
+        let Some(open) = self.open.as_mut() else {
             return;
         };
+        let sample = if open.launched.is_empty() && !open.outside_learned { Sample::First } else { Sample::More };
         open.launched.insert(key.to_string());
-        let open = &*open;
-        let shown = &open.candidates[..open.shown.min(open.candidates.len())];
+        let open = self.open.as_ref().expect("just updated");
+        self.ledger.learn(&open.snapshot, key, 1., sample);
+
+        let shown = open.shown.min(open.candidates.len());
         // 打开后在设置里调大了"猜你要打开"的数量时, 点的名次可能超出当时记下的范围, 按没摆出来算
         let position = match via {
-            Via::Predicted(rank) if rank < shown.len() => Some(rank),
-            _ => shown.iter().position(|c| c.key == key),
+            Via::Predicted(rank) if rank < shown => Some(rank),
+            _ => open.candidates[..shown].iter().position(|c| c.key == key),
         };
-        let learn = &PARAMS.learn;
-        let (skipped, shares, chosen_features): (&[Ranked], Vec<f64>, Features) = match position {
-            Some(rank) => {
-                let skipped = &shown[rank.saturating_sub(learn.skip_window)..rank];
-                let shares = (0..skipped.len()).map(|ix| learn.skip_decay.powi((skipped.len() - 1 - ix) as i32));
-                (skipped, shares.collect(), shown[rank].features)
-            }
-            None => {
-                let features = match open.candidates.iter().find(|c| c.key == key) {
-                    Some(c) => c.features,
-                    None => {
-                        self.model.features(at, week_minute(&self.db, at), &open.facets, [(key, &Signals::default())])
-                            [0]
-                    }
-                };
-                let skipped = &shown[..learn.elsewhere_skipped.min(shown.len())];
-                (skipped, vec![1.; skipped.len()], features)
-            }
-        };
-        let (skipped, mut shares): (Vec<&Ranked>, Vec<f64>) =
-            skipped.iter().zip(shares).filter(|(c, _)| !open.launched.contains(&c.key)).unzip();
+        let (skipped, mut shares): (Vec<&Ranked>, Vec<f64>) = skipped_shares(shown, position)
+            .into_iter()
+            .map(|(ix, share)| (&open.candidates[ix], share))
+            .filter(|(c, _)| !open.launched.contains(&c.key))
+            .unzip();
         if skipped.is_empty() {
             return;
+        }
+        let mut chosen_features = match open.candidates.iter().find(|c| c.key == key) {
+            Some(c) => c.features,
+            None => self.single_features(&open.snapshot, key, at),
+        };
+        if open.with_jev {
+            // 被点的不在 Jev 的候选里时它的概率按 0 算, 与 apply_jev 一致
+            let jev = open.candidates.iter().find(|c| c.key == key).and_then(|c| c.jev).unwrap_or(0.);
+            brain::set_jev(&mut chosen_features, jev);
         }
         let mut rows: Vec<Features> = skipped.iter().map(|c| c.features).collect();
         rows.push(chosen_features);
         shares.push(1.);
-        let chosen = rows.len() - 1;
-        if open.with_jev {
-            // 被点的不在 Jev 的候选里时它的概率按 0 算, 与 apply_jev 一致
-            let jev = open.candidates.iter().find(|c| c.key == key).and_then(|c| c.jev).unwrap_or(0.);
-            predict::set_jev(&mut rows[chosen], jev);
-        }
-        self.weights.learn(&rows, &shares, chosen, open.with_jev);
+        self.weights.learn(&rows, &shares, rows.len() - 1, open.with_jev);
         let skipped: Vec<String> = skipped.iter().map(|c| c.target.to_string_lossy().into_owned()).collect();
         if let Err(e) = self.write_feedback(&skipped, at) {
             storage::db_save_failed(&e);
@@ -396,14 +394,47 @@ impl Library {
         log::debug!("learned from {} for {}", via.as_db(), target.display());
     }
 
-    /// 分组里的项目, 系统最近记录, 时间线里最近碰过的目标 (同一目标只留一个, 依次优先), 按本地分数排好.
-    fn candidates(&self, situation: &Situation, facets: &Facets, now: i64, week_minute: u16) -> Vec<Ranked> {
+    /// 呼出 QRun 后 outside_minutes 内, 没从 QRun 打开东西, 而是从任务栏, 资源管理器等别处打开了 key: 这也是这次情境下
+    /// 想开的东西, 给标签账记一笔 (每次打开只记第一个). 不学权重: 不知道用户看到了推荐里的哪些.
+    /// 系统最近记录是下次呼出时才读到的, 那时这次已是上一次, 所以两次都看.
+    pub(super) fn learn_outside(&mut self, key: &str, at: i64) {
+        let window = PARAMS.sample.outside_minutes * MINUTE;
+        let open = [self.open.as_mut(), self.previous_open.as_mut()]
+            .into_iter()
+            .flatten()
+            .find(|open| open.at < at && at - open.at <= window);
+        let Some(open) = open.filter(|open| open.launched.is_empty() && !open.outside_learned) else {
+            return;
+        };
+        open.outside_learned = true;
+        self.ledger.learn(&open.snapshot, key, 1., Sample::First);
+        log::debug!("learned outside open of {key}");
+    }
+
+    /// 不在候选里的目标 (如在分组里另点的, 时间线还没碰过的) 在这次情境下的特征: 没有状态, 没被跳过.
+    fn single_features(&self, snapshot: &Snapshot, key: &str, at: i64) -> Features {
+        let single = Snapshot {
+            at,
+            week_minute: snapshot.week_minute,
+            tags: snapshot.tags.clone(),
+            candidates: vec![Candidate { key: key.to_string(), states: Vec::new(), skipped: 0. }],
+        };
+        brain::features(&self.model, &self.ledger, &single)[0]
+    }
+
+    /// 分组里的项目, 系统最近记录, 时间线里最近碰过的目标 (同一目标只留一个, 依次优先), 按本地分数排好;
+    /// 连同记账用的快照 (情境标签和各候选的状态).
+    fn candidates(
+        &self,
+        situation: &Situation,
+        gap: Option<i64>,
+        now: i64,
+        week_minute: u16,
+    ) -> (Vec<Ranked>, Snapshot) {
         let recent = Recent::of(&self.timeline, now);
-        let tokens = activity::tokens(&self.timeline, now);
         let mut seen = HashSet::new();
         let mut list: Vec<Ranked> = Vec::new();
-        let items = self.groups.iter().flat_map(|g| &g.items);
-        for item in items {
+        for item in self.groups.iter().flat_map(|g| &g.items) {
             let key = predict::key(&item.target);
             if seen.insert(key.clone()) {
                 list.push(ranked(
@@ -432,34 +463,31 @@ impl Library {
         let skipped = self.skipped(now);
         let title = situation.title.as_deref().unwrap_or("").to_lowercase();
         let running: HashSet<String> = situation.running().into_iter().map(predict::key).collect();
-        let signals: Vec<Signals> = list
-            .iter()
-            .map(|c| {
-                let name = c.name.to_lowercase();
-                let activity = recent.activity(&c.key);
-                Signals {
-                    modified: activity.modified,
-                    focused_minutes: activity.focused_minutes,
-                    started: activity.started,
-                    nearby: recent.nearby(&c.key),
-                    after_events: self.cooccur.after_events(&tokens, &c.key, now),
+        let foreground = situation.foreground.as_deref().map(predict::key);
+        let input = StateInput { running: &running, foreground: foreground.as_deref(), title: &title, recent: &recent };
+        for c in &mut list {
+            c.states = tags::states(&c.key, &c.name, c.kind, &input);
+        }
+        let snapshot = Snapshot {
+            at: now,
+            week_minute,
+            tags: tags::context(situation, &self.timeline, gap, now),
+            candidates: list
+                .iter()
+                .map(|c| Candidate {
+                    key: c.key.clone(),
+                    states: c.states.clone(),
                     skipped: skipped.get(&c.key).copied().unwrap_or(0.),
-                    // 一个字的名称在标题里到处都是, 不算
-                    in_title: name.chars().count() >= 2 && title.contains(&name),
-                    running: running.contains(&c.key),
-                    fresh_hours: (c.kind == NEW_FILE)
-                        .then(|| (now - c.at.expect("新文件有出现时间")) as f64 / HOUR as f64),
-                }
-            })
-            .collect();
-        let features =
-            self.model.features(now, week_minute, facets, list.iter().map(|c| c.key.as_str()).zip(signals.iter()));
+                })
+                .collect(),
+        };
+        let features = brain::features(&self.model, &self.ledger, &snapshot);
         for (c, x) in list.iter_mut().zip(features) {
             c.score = self.weights.score(&x, false);
             c.features = x;
         }
         sort(&mut list);
-        list
+        (list, snapshot)
     }
 
     fn minutes_since_last_open(&self, now: i64) -> Option<i64> {
@@ -470,21 +498,17 @@ impl Library {
     /// 最近 skip_days 天里各目标被跳过的次数, 越早的分量越小 (每天减到约三分之一).
     fn skipped(&self, now: i64) -> HashMap<String, f64> {
         let since = now - PARAMS.learn.skip_days * DAY;
-        let mut counts = HashMap::new();
         let rows = self.db.prepare_cached("SELECT target, at FROM skips WHERE at >= ?1").and_then(|mut stmt| {
             stmt.query_map([since], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()
         });
         match rows {
-            Ok(rows) => {
-                for (target, at) in rows {
-                    *counts.entry(predict::key(Path::new(&target))).or_insert(0.) +=
-                        (-((now - at) as f64) / DAY as f64).exp();
-                }
+            Ok(rows) => skip_counts(rows.iter().map(|(target, at)| (target.as_str(), *at)), now),
+            Err(e) => {
+                log::warn!("读取跳过记录失败: {e}");
+                HashMap::new()
             }
-            Err(e) => log::warn!("读取跳过记录失败: {e}"),
         }
-        counts
     }
 
     /// 最近的启动, 给 Jev 看行为序列.
@@ -524,11 +548,10 @@ impl Library {
             tx.execute("DELETE FROM shown WHERE open_id = ?1", [open.id])?;
             {
                 let mut insert = tx.prepare(
-                    "INSERT INTO shown (open_id, rank, target, score, jev, features) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO shown (open_id, rank, target, score, jev, features) VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
                 )?;
                 for (rank, c) in open.candidates.iter().take(open.shown).enumerate() {
-                    let features = serde_json::to_string(&c.features).expect("serialize features");
-                    insert.execute(params![open.id, rank, c.target.to_string_lossy(), c.score, c.jev, features])?;
+                    insert.execute(params![open.id, rank, c.target.to_string_lossy(), c.score, c.jev])?;
                 }
             }
             tx.commit()
@@ -545,14 +568,8 @@ impl Library {
             for target in skipped {
                 skip.execute(params![target, at])?;
             }
-            let mut weight = tx.prepare(
-                "INSERT INTO weights (name, value, grad_sq) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (name) DO UPDATE SET value = excluded.value, grad_sq = excluded.grad_sq",
-            )?;
-            for (ix, name) in FEATURES.iter().enumerate() {
-                weight.execute(params![name, self.weights.value[ix], self.weights.grad_sq[ix]])?;
-            }
         }
+        write_weights(&tx, &self.weights)?;
         tx.commit()
     }
 
@@ -590,6 +607,29 @@ impl Open {
     }
 }
 
+/// 被点的目标前面哪些算被跳过, 各算多少分量 (下标指排好的候选). shown 是 "猜你要打开" 摆出了几个, position 是
+/// 被点的在其中的名次: 在里面时它上面最近的 skip_window 个, 离得越远分量越小; 没摆出来 (在分组或搜索里另点了别的)
+/// 时前 elsewhere_skipped 个, 推荐里没有才去别处点, 这是推荐失算, 要学.
+pub(super) fn skipped_shares(shown: usize, position: Option<usize>) -> Vec<(usize, f64)> {
+    let learn = &PARAMS.learn;
+    match position {
+        Some(rank) => {
+            let start = rank.saturating_sub(learn.skip_window);
+            (start..rank).map(|ix| (ix, learn.skip_decay.powi((rank - 1 - ix) as i32))).collect()
+        }
+        None => (0..learn.elsewhere_skipped.min(shown)).map(|ix| (ix, 1.)).collect(),
+    }
+}
+
+/// 各目标被跳过的次数, 越早的分量越小 (每天减到约三分之一); 比较键为键.
+pub(super) fn skip_counts<'a>(rows: impl IntoIterator<Item = (&'a str, i64)>, now: i64) -> HashMap<String, f64> {
+    let mut counts = HashMap::new();
+    for (target, at) in rows {
+        *counts.entry(predict::key(Path::new(target))).or_insert(0.) += (-((now - at) as f64) / DAY as f64).exp();
+    }
+    counts
+}
+
 /// 库里学到的权重; 没学过的特征用初始值.
 pub(super) fn read_weights(db: &Connection) -> rusqlite::Result<Weights> {
     let mut weights = Weights::initial();
@@ -606,11 +646,27 @@ pub(super) fn read_weights(db: &Connection) -> rusqlite::Result<Weights> {
     Ok(weights)
 }
 
-fn facets(situation: &Situation, gap: Option<i64>) -> Facets {
-    Facets {
-        foreground: situation.foreground.as_deref().map(predict::key),
-        gap: gap.map(predict::gap_bucket),
-        clipboard: situation.clipboard.clone(),
+pub(super) fn write_weights(db: &Connection, weights: &Weights) -> rusqlite::Result<()> {
+    let mut weight = db.prepare(
+        "INSERT INTO weights (name, value, grad_sq) VALUES (?1, ?2, ?3)
+         ON CONFLICT (name) DO UPDATE SET value = excluded.value, grad_sq = excluded.grad_sq",
+    )?;
+    for (ix, name) in FEATURES.iter().enumerate() {
+        weight.execute(params![name, weights.value[ix], weights.grad_sq[ix]])?;
+    }
+    Ok(())
+}
+
+fn clone_snapshot(snapshot: &Snapshot) -> Snapshot {
+    Snapshot {
+        at: snapshot.at,
+        week_minute: snapshot.week_minute,
+        tags: snapshot.tags.clone(),
+        candidates: snapshot
+            .candidates
+            .iter()
+            .map(|c| Candidate { key: c.key.clone(), states: c.states.clone(), skipped: c.skipped })
+            .collect(),
     }
 }
 
@@ -618,7 +674,7 @@ fn rescore(candidates: &mut [Ranked], probabilities: &HashMap<String, f64>, weig
     for c in candidates {
         let p = probabilities.get(&c.key).copied().unwrap_or(0.);
         c.jev = Some(p);
-        predict::set_jev(&mut c.features, p);
+        brain::set_jev(&mut c.features, p);
         c.score = weights.score(&c.features, true);
     }
 }
@@ -635,11 +691,22 @@ fn ranked(
     kind: &'static str,
     at: Option<i64>,
 ) -> Ranked {
-    Ranked { key, name, target, item, kind, at, features: [0.; FEATURES.len()], jev: None, score: 0. }
+    Ranked {
+        key,
+        name,
+        target,
+        item,
+        kind,
+        at,
+        states: Vec::new(),
+        features: [0.; FEATURES.len()],
+        jev: None,
+        score: 0.,
+    }
 }
 
 /// 分组项目的类型, 给 Jev 看.
-fn kind(target: &Path) -> &'static str {
+pub(super) fn kind(target: &Path) -> &'static str {
     let text = target.to_string_lossy().to_lowercase();
     if text.starts_with("shell:appsfolder") || text.ends_with(".exe") || text.ends_with(".lnk") {
         "program"
@@ -652,7 +719,7 @@ fn kind(target: &Path) -> &'static str {
     }
 }
 
-fn display_name(path: &Path) -> String {
+pub(super) fn display_name(path: &Path) -> String {
     path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
 }
 

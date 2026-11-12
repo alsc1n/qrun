@@ -31,13 +31,12 @@
     "evidence_floor": 0.0,
     "jev_smoothing": 0.05,
     "initial": {
-      "in_title": 1.0,
-      "fresh": 6.0,
-      "modified": 1.0,
-      "focused": 0.3,
-      "started": 0.5,
-      "nearby": 1.0,
-      "after_events": 2.0
+      "frequency": 1.0,
+      "hour": 1.0,
+      "day": 1.0,
+      "after_previous": 1.0,
+      "context": 1.0,
+      "state": 1.0
     },
     "skip_window": 5,
     "skip_decay": 0.7,
@@ -80,8 +79,39 @@
     "candidates": 30,
     "nearby_paths": 50,
     "token_minutes": 10,
-    "cooccur_half_life_days": 30,
     "jev_events": 20
+  },
+  "tags": {
+    "max_context_tags": 40,
+    "clip_minutes": 30,
+    "clip_words": 8,
+    "cjk_word_chars": 4,
+    "title_tags": 4,
+    "title_segment_chars": 30,
+    "stopwords": ["the", "and", "for", "with", "from", "this", "that", "are", "is", "to", "of", "in", "on", "的", "了", "是"],
+    "modified": 0.25,
+    "focused_minutes": 5.0,
+    "started": 0.25,
+    "nearby": 0.3
+  },
+  "ledger": {
+    "half_life_days": 30.0,
+    "smoothing": 2.0,
+    "state_smoothing": 2.0,
+    "state_priors": {
+      "自己:新文件": 20.0,
+      "自己:刚改过": 2.0,
+      "自己:在标题里": 2.0,
+      "自己:附近": 2.0,
+      "自己:刚启动": 1.5
+    }
+  },
+  "sample": {
+    "outside_minutes": 5,
+    "outside_focus_seconds": 30
+  },
+  "replay": {
+    "candidates": 300
   },
   "history": {
     "archive_after_minutes": 10,

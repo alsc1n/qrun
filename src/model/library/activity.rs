@@ -1,10 +1,9 @@
-//! 时间线的用法: 从最近活动算各候选的近况, 列出时间线里碰过的目标当候选, 拼给 Jev 的活动摘要;
-//! 以及"出现某件事之后常开什么"的长期统计 (cooccur 表). 都不按目录名或文件类型写规则, 权重由学习决定.
+//! 时间线的用法: 从最近活动算各候选的近况, 列出时间线里碰过的目标当候选, 最近发生了哪些事 (情境标签),
+//! 用户自己开了哪些程序, 拼给 Jev 的活动摘要. 都不按目录名或文件类型写规则, 权重由学习决定.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
 use super::timeline::{Event, Timeline, What};
@@ -12,9 +11,6 @@ use crate::model::predict::key;
 use crate::params::PARAMS;
 
 const MINUTE: i64 = 60_000;
-const DAY: i64 = 86_400_000;
-/// 衰减到这么小的统计在读库时删掉, 表不会一直变大.
-const STALE: f64 = 0.01;
 
 /// 一个目标在最近活动里的近况, 按距今衰减 (activity_half_life_minutes).
 /// 改动和启动只看最近一次有多近 (0 到 1), 不累加次数: 后台程序每隔几秒写一次日志, 次数成百上千,
@@ -168,89 +164,24 @@ pub(super) fn summary(timeline: &Timeline, now: i64) -> Vec<Value> {
         .collect()
 }
 
-/// 按 cooccur_half_life_days 衰减的次数: 存次数和记下它的时间, 用时换算到现在.
-#[derive(Clone, Copy)]
-struct Decayed {
-    count: f64,
-    at: i64,
-}
-
-impl Decayed {
-    fn value(self, now: i64) -> f64 {
-        let half_life = (PARAMS.timeline.cooccur_half_life_days * DAY) as f64;
-        self.count * (-((now - self.at) as f64) / half_life).exp2()
-    }
-
-    fn add(&mut self, now: i64) {
-        *self = Self { count: self.value(now) + 1., at: now };
-    }
-}
-
-/// "出现某件事之后打开了什么"的统计: 标记 -> (出现后打开过东西的次数, 各目标的次数). 只记从 QRun 打开的,
-/// 用那次打开时的标记 (`tokens`). 全部读进内存, 改动随时写库.
-#[derive(Default)]
-pub(super) struct Cooccur {
-    tokens: HashMap<String, (Decayed, HashMap<String, Decayed>)>,
-}
-
-impl Cooccur {
-    /// 读库, 顺带删掉衰减得差不多的.
-    pub(super) fn read(db: &Connection) -> rusqlite::Result<Self> {
-        let now = super::now_ms();
-        let rows = db
-            .prepare("SELECT token, target, count, at FROM cooccur")?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    Decayed { count: row.get(2)?, at: row.get(3)? },
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut cooccur = Self::default();
-        let tx = db.unchecked_transaction()?;
-        for (token, target, decayed) in rows {
-            let value = decayed.value(now);
-            if value < STALE {
-                tx.execute("DELETE FROM cooccur WHERE token = ?1 AND target = ?2", params![token, target])?;
-                continue;
+/// 程序是用户自己开的 (从任务栏, 开始菜单, 桌面): 启动后 outside_focus_seconds 内到了前台. 后台拉起的程序不会到前台.
+/// 返回这样启动的程序和启动时间, 早的在前; 用来把 "呼出 QRun 后从别处打开" 也当成学习的样本.
+pub(super) fn user_started<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<(String, i64)> {
+    let window = PARAMS.sample.outside_focus_seconds * 1000;
+    let mut pending: Vec<(String, i64)> = Vec::new();
+    let mut started = Vec::new();
+    for event in events {
+        match &event.what {
+            What::Started { program } => pending.push((key(Path::new(program)), event.start)),
+            What::Focus { program, .. } if !program.is_empty() => {
+                let program = key(Path::new(program));
+                if let Some(ix) = pending.iter().position(|(p, at)| *p == program && event.start - at <= window) {
+                    started.push(pending.remove(ix));
+                }
             }
-            let (total, targets) =
-                cooccur.tokens.entry(token).or_insert_with(|| (Decayed { count: 0., at: now }, HashMap::new()));
-            total.count += value;
-            targets.insert(target, Decayed { count: value, at: now });
+            _ => {}
         }
-        tx.commit()?;
-        Ok(cooccur)
+        pending.retain(|(_, at)| event.start - at <= window);
     }
-
-    /// 出现这些事之后打开 key 的比例, 取其中最高的一件; 次数少时向 0 平滑.
-    pub(super) fn after_events(&self, tokens: &[String], key: &str, now: i64) -> f64 {
-        tokens
-            .iter()
-            .filter_map(|token| self.tokens.get(token))
-            .map(|(total, targets)| {
-                let count = targets.get(key).map_or(0., |c| c.value(now));
-                count / (total.value(now) + PARAMS.predict.smoothing)
-            })
-            .fold(0., f64::max)
-    }
-
-    /// 出现这些事之后打开了 key.
-    pub(super) fn learn(&mut self, db: &Connection, tokens: &[String], key: &str, now: i64) -> rusqlite::Result<()> {
-        let tx = db.unchecked_transaction()?;
-        for token in tokens {
-            let (total, targets) =
-                self.tokens.entry(token.clone()).or_insert_with(|| (Decayed { count: 0., at: now }, HashMap::new()));
-            total.add(now);
-            let count = targets.entry(key.to_string()).or_insert(Decayed { count: 0., at: now });
-            count.add(now);
-            tx.execute(
-                "INSERT INTO cooccur (token, target, count, at) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (token, target) DO UPDATE SET count = excluded.count, at = excluded.at",
-                params![token, key, count.count, count.at],
-            )?;
-        }
-        tx.commit()
-    }
+    started
 }

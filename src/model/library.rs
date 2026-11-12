@@ -11,21 +11,25 @@ use gpui_kit::{Context, Task};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
-use super::predict::{self, Facets, Launch, Model, Tuning, Weights};
+use super::brain::{Ledger, Weights};
+use super::predict::{self, Launch, Model, Tuning};
 use super::redact::redact;
 use super::rolan;
 use crate::params::PARAMS;
 use crate::storage;
 
 mod activity;
+mod replay;
 mod smart;
+mod tags;
 mod timeline;
 
+pub use replay::report;
 pub use smart::{Ranked, Situation, Via, Window};
 pub use timeline::What;
 
 /// 库结构版本; 破坏性变更时加一, 并在 migrate 里加上从旧版本迁移的语句.
-const DB_VERSION: u32 = 11;
+const DB_VERSION: u32 = 12;
 const LEGACY_FILE: &str = "library.json";
 const LEGACY_VERSION: u32 = 1;
 
@@ -145,6 +149,13 @@ const SCHEMA_V11: &str = "
     CREATE INDEX history_end ON history (end);
 ";
 
+/// 12: 推荐改为按标签记账 (`model::brain`), 账由回放从历史建出, 不存库; "出现某件事之后打开了什么"并入标签账,
+/// 删掉 cooccur 表. 特征换了, 旧权重清掉.
+const SCHEMA_V12: &str = "
+    DROP TABLE cooccur;
+    DELETE FROM weights;
+";
+
 const INSERT_LAUNCH: &str = "INSERT INTO launches (item_id, target, at, source, week_minute, open_id, via, rank)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
@@ -159,19 +170,21 @@ pub struct Library {
     /// 全部启动记录 (含系统来源), 按时间排好, 预测从这里学.
     launches: Vec<Launch>,
     model: Model,
+    /// 标签账; 启动后由后台回放建出, 之后每次打开实时加.
+    ledger: Ledger,
     weights: Weights,
     /// 上次读到的系统最近记录和新文件, 推荐页的候选.
     system: Vec<Observed>,
     /// 当前这次打开 QRun 的情境和排好的候选; 启动时据此学对错.
     open: Option<smart::Open>,
+    /// 上一次打开; 呼出后从别处打开的东西常在下次呼出时才从系统最近记录读到, 那时要记到这一次上.
+    previous_open: Option<smart::Open>,
     /// 最近一次调用 Jev 的时间和结果 (失败带原因), 设置页显示; 这次运行还没调过为 None.
     jev_last: Option<(String, Result<(), String>)>,
     /// 最近一段活动时间线.
     timeline: timeline::Timeline,
-    /// "出现某件事之后打开了什么"的长期统计.
-    cooccur: activity::Cooccur,
     db: Connection,
-    /// 定时回放调参的后台任务.
+    /// 定时回放 (调参, 建账, 重练权重) 的后台任务.
     tuning: Task<()>,
 }
 
@@ -295,7 +308,6 @@ impl Library {
         let launches = read_launches(&db).map_err(fail)?;
         let weights = smart::read_weights(&db).map_err(fail)?;
         let timeline = timeline::Timeline::read(&db).map_err(fail)?;
-        let cooccur = activity::Cooccur::read(&db).map_err(fail)?;
         let max_id = groups.iter().flat_map(|g| std::iter::once(g.id).chain(g.items.iter().map(|i| i.id))).max();
         let mut library = Self {
             groups,
@@ -303,12 +315,13 @@ impl Library {
             clicks,
             model: Model::build(&launches, Tuning::initial()),
             launches,
+            ledger: Ledger::default(),
             weights,
             system: Vec::new(),
             open: None,
+            previous_open: None,
             jev_last: None,
             timeline,
-            cooccur,
             db,
             tuning: Task::ready(()),
         };
@@ -361,17 +374,40 @@ impl Library {
         items.into_iter().take(n).map(|(i, _)| i.clone()).collect()
     }
 
-    /// 启动时和之后每隔 replay_interval_hours 在后台回放历史调参, 调好后按新参数重建统计.
+    /// 启动时和之后每隔 replay_interval_hours 在后台回放历史: 先调程序本身统计的参数, 再用全部历史从零建标签账,
+    /// 重练权重, 换掉在线学到的 (回放和在线是同一套算法, 用全部历史比一次次在线学更稳). 启动时这一轮跑完前账是空的,
+    /// 推荐只按程序本身的统计和权重排.
     pub fn start_tuning(&mut self, cx: &mut Context<Self>) {
         let interval = Duration::from_secs(PARAMS.predict.replay_interval_hours * 3600);
         self.tuning = cx.spawn(async move |this, cx| {
             loop {
-                let Ok(launches) = this.read_with(cx, |lib, _| lib.launches.clone()) else {
+                let Ok((launches, items)) = this.read_with(cx, |lib, _| (lib.launches.clone(), replay::items(lib)))
+                else {
                     return;
                 };
-                let tuning = cx.background_executor().spawn(async move { predict::tune(&launches, now_ms()) }).await;
-                let rebuilt = this.update(cx, |lib, _| lib.model = Model::build(&lib.launches, tuning));
-                if rebuilt.is_err() {
+                let replayed = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let tuning = predict::tune(&launches, now_ms());
+                        (tuning, storage::open_db_read_only().and_then(|db| replay::run(&db, &items, tuning)))
+                    })
+                    .await;
+                let updated = this.update(cx, |lib, _| {
+                    let (tuning, result) = replayed;
+                    lib.model = Model::build(&lib.launches, tuning);
+                    match result {
+                        Ok((ledger, weights, report)) => {
+                            log::info!("回放: {report}");
+                            lib.ledger = ledger;
+                            lib.weights = weights;
+                            if let Err(e) = smart::write_weights(&lib.db, &lib.weights) {
+                                storage::db_save_failed(&e);
+                            }
+                        }
+                        Err(e) => log::warn!("回放失败: {e}"),
+                    }
+                });
+                if updated.is_err() {
                     return;
                 }
                 cx.background_executor().timer(interval).await;
@@ -521,13 +557,7 @@ impl Library {
     /// item 是对应的项目, 从推荐页打开的系统最近项没有项目, 不计点击次数.
     pub fn record_launch(&mut self, item: Option<Id>, target: &Path, via: Via, cx: &mut Context<Self>) {
         let at = now_ms();
-        let open = self.open.as_ref().map(|open| (open.id, open.facets.clone()));
-        let launch = Launch {
-            key: predict::key(target),
-            at,
-            week_minute: week_minute(&self.db, at),
-            facets: open.as_ref().map(|(_, facets)| facets.clone()),
-        };
+        let launch = Launch { key: predict::key(target), at, week_minute: week_minute(&self.db, at) };
         let result = self.db.execute(
             INSERT_LAUNCH,
             params![
@@ -536,7 +566,7 @@ impl Library {
                 at,
                 "qrun",
                 launch.week_minute,
-                open.map(|(id, _)| id),
+                self.open_id(),
                 via.as_db(),
                 via.rank()
             ],
@@ -545,11 +575,6 @@ impl Library {
             storage::db_save_failed(&e);
         }
         self.learn(&launch.key, target, via, at);
-        if let Some(open) = &self.open
-            && let Err(e) = self.cooccur.learn(&self.db, &open.tokens, &launch.key, at)
-        {
-            storage::db_save_failed(&e);
-        }
         self.record(What::Launch { target: target.to_string_lossy().into_owned() });
         self.model.add(&launch);
         self.launches.push(launch);
@@ -567,11 +592,14 @@ impl Library {
         let dirs = own_dirs();
         observed.retain(|entry| !is_own(&predict::key(&entry.target), &dirs));
         match self.write_observed(&observed) {
-            Ok(true) => {
+            Ok(added) if !added.is_empty() => {
                 // 系统记录的时间可能早于已有记录, 不能接着往后加, 重新读一遍按时间排好
                 self.reload_launches();
+                for (key, at) in added {
+                    self.learn_outside(&key, at);
+                }
             }
-            Ok(false) => {}
+            Ok(_) => {}
             Err(e) => storage::db_save_failed(&e),
         }
         self.system = observed;
@@ -590,9 +618,9 @@ impl Library {
         appeared
     }
 
-    /// 返回是否记了新的启动. 打开文件时系统会把它所在的文件夹也记一笔, 和里面某个文件相差不到
+    /// 返回新记的启动 (比较键, 时间). 打开文件时系统会把它所在的文件夹也记一笔, 和里面某个文件相差不到
     /// folder_merge_seconds 的文件夹不算一次启动 (仍在最近文件夹里显示, 也仍是候选).
-    fn write_observed(&self, observed: &[Observed]) -> rusqlite::Result<bool> {
+    fn write_observed(&self, observed: &[Observed]) -> rusqlite::Result<Vec<(String, i64)>> {
         let dedupe = PARAMS.predict.dedupe_seconds * 1000;
         let merge = PARAMS.predict.folder_merge_seconds * 1000;
         let files: Vec<(String, i64)> = observed
@@ -604,7 +632,7 @@ impl Library {
             files.iter().any(|(folder, at)| *folder == predict::key(&e.target) && (at - e.at).abs() <= merge)
         };
         let tx = self.db.unchecked_transaction()?;
-        let mut added = false;
+        let mut added = Vec::new();
         {
             let mut last_seen = tx.prepare("SELECT at FROM system_seen WHERE target = ?1")?;
             let mut seen = tx.prepare(
@@ -635,7 +663,7 @@ impl Library {
                         None::<&str>,
                         None::<i64>
                     ])?;
-                    added = true;
+                    added.push((key, entry.at));
                 }
             }
         }
@@ -799,6 +827,7 @@ fn migrate(from: u32, db: &Transaction) -> rusqlite::Result<()> {
         // 10: 9 的规则漏了厂商前缀加十六进制的密钥 (sk_ 加 32 位), 按改好的规则再脱敏一遍, 含剪贴板文字
         8 | 9 => redact_saved(db),
         10 => db.execute_batch(SCHEMA_V11),
+        11 => db.execute_batch(SCHEMA_V12),
         _ => unreachable!("qrun.db 没有版本 {from} 的迁移"),
     }
 }
@@ -895,30 +924,17 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock after 1970").as_millis() as i64
 }
 
-/// 启动记录按时间排好; 来自某次打开 QRun 的带上那次的情境.
+/// 启动记录按时间排好.
 fn read_launches(db: &Connection) -> rusqlite::Result<Vec<Launch>> {
-    db.prepare(
-        "SELECT l.target, l.at, l.week_minute, l.open_id, o.foreground, o.gap_minutes, o.clipboard
-         FROM launches l LEFT JOIN opens o ON o.id = l.open_id ORDER BY l.at, l.id",
-    )?
-    .query_map([], |row| {
-        let open: Option<i64> = row.get(3)?;
-        let facets = match open {
-            None => None,
-            Some(_) => Some(Facets {
-                foreground: row.get::<_, Option<String>>(4)?.map(|p| predict::key(Path::new(&p))),
-                gap: row.get::<_, Option<i64>>(5)?.map(predict::gap_bucket),
-                clipboard: row.get(6)?,
-            }),
-        };
-        Ok(Launch {
-            key: predict::key(Path::new(&row.get::<_, String>(0)?)),
-            at: row.get(1)?,
-            week_minute: row.get(2)?,
-            facets,
-        })
-    })?
-    .collect()
+    db.prepare("SELECT target, at, week_minute FROM launches ORDER BY at, id")?
+        .query_map([], |row| {
+            Ok(Launch {
+                key: predict::key(Path::new(&row.get::<_, String>(0)?)),
+                at: row.get(1)?,
+                week_minute: row.get(2)?,
+            })
+        })?
+        .collect()
 }
 
 /// 按位置读出分组和各自的项目.

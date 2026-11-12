@@ -19,6 +19,16 @@ fn main() {
         log::error!("{info}");
         platform::error_box(&format!("QRun 出错, 即将退出. 请把下面的内容反馈给开发者:\n\n{info}"))
     }));
+    // 开发用: 只读回放历史, 在启动它的终端里打印新算法和当时的命中率, 不开界面 (可与正在运行的 QRun 同时用)
+    if std::env::args().any(|arg| arg == "--replay") {
+        platform::attach_console();
+        storage::locate();
+        match model::library::report() {
+            Ok(report) => println!("{report}"),
+            Err(message) => eprintln!("{message}"),
+        }
+        return;
+    }
     // 只开一个: 已在运行就让它显示面板, 自己退出. 要在开日志前判断, 否则会去改名正在运行的那个开着的 qrun.log.
     // 重启 (如更改数据目录后) 时旧的正在退出, 等它退完
     let restarting = std::env::args().any(|arg| arg == platform::install::RESTART_ARG);

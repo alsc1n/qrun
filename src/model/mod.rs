@@ -1,5 +1,6 @@
 //! 数据和业务操作, 不依赖界面.
 
+pub mod brain;
 pub mod jev;
 pub mod library;
 pub mod predict;

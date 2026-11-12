@@ -1,107 +1,18 @@
-//! 预测下一个要打开的东西, 只从启动记录学: 记录越多越贴近个人习惯.
+//! 程序本身的统计, 只从启动记录学: 记录越多越贴近个人习惯. 是推荐打分 (`model::brain`) 的前四项.
 //!
-//! 候选 i 在当前情况下的分数 (朴素贝叶斯 + 前后衔接):
-//!   ln 常用度(i) + ln P(钟点 | i) + ln P(工作日/周末 | i) + ln [P(i | 上一个) / P(i)]
+//! 候选 i 在当前时刻的四项 (朴素贝叶斯 + 前后衔接):
+//!   ln 常用度(i), ln P(钟点 | i), ln P(工作日/周末 | i), ln [P(i | 上一个) / P(i)]
 //! - 常用度: 每条记录按 2^(-距今 / 半衰期) 衰减后计数, 不用的东西自然往下掉.
 //! - 钟点: 一次启动按正态核摊到前后钟点上, 8:55 和 9:05 算同一个习惯.
 //! - 前后衔接: 上一次启动在 session_gap 内时, 统计"上一个之后接着开 i"; 超过就算"刚开始干活".
 //! - 钟点, 工作日/周末, 前后衔接都向整体分布平滑, 记录少时不会因一两次巧合排到前面.
 //!
 //! 半衰期和核宽不写死: `tune` 回放最近的历史, 每次只用之前的记录预测, 选命中率最高的一组.
-//!
-//! 上面四项之外还有打开 QRun 那一刻的情境 (前台程序, 距上次打开多久, 剪贴板类型, 同样按 lift 算), 以及最近被跳过几次,
-//! 名称是否出现在前台窗口标题里, 是否正在运行, 是不是刚出现的新文件, 活动时间线里的近况 (刚被改过, 在前台停了多久,
-//! 刚启动, 和最近活动的路径有多近, 出现最近这些事之后常开它的程度), 常开的文件类型, Jev 给的概率. 各项合成一组特征,
-//! 最终分数是特征的加权和; 权重 (`Weights`) 从每次打开时的对错里学: 被点的是对, 摆在它前面却没被点的是错.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::params::PARAMS;
-
-/// 特征名, 与 `Features` 的下标一一对应; 也是库里 weights 表的键.
-pub const FEATURES: [&str; 18] = [
-    "frequency",
-    "hour",
-    "day",
-    "after_previous",
-    "foreground",
-    "gap",
-    "clipboard",
-    "skipped",
-    "in_title",
-    "running",
-    "fresh",
-    "modified",
-    "focused",
-    "started",
-    "nearby",
-    "after_events",
-    "extension",
-    "jev",
-];
-pub const SKIPPED: usize = 7;
-pub const IN_TITLE: usize = 8;
-pub const RUNNING: usize = 9;
-const FRESH: usize = 10;
-const MODIFIED: usize = 11;
-const FOCUSED: usize = 12;
-const STARTED: usize = 13;
-const NEARBY: usize = 14;
-const AFTER_EVENTS: usize = 15;
-const EXTENSION: usize = 16;
-const JEV: usize = 17;
-/// 前四项是朴素贝叶斯的四项, 初始权重为 1, 起步就是只按记录打分.
-const BASE_TERMS: usize = 4;
-
-pub type Features = [f64; FEATURES.len()];
-
-/// 打开 QRun 那一刻能从历史里学"这种情况下常开什么"的情境, 拿不到的为 None.
-#[derive(Clone, Default)]
-pub struct Facets {
-    /// 打开 QRun 前的前台程序的比较键.
-    pub foreground: Option<String>,
-    /// 距上次打开 QRun 的区间, 见 `gap_bucket`.
-    pub gap: Option<String>,
-    /// 剪贴板类型.
-    pub clipboard: Option<String>,
-}
-
-impl Facets {
-    fn values(&self) -> [Option<&String>; 3] {
-        [self.foreground.as_ref(), self.gap.as_ref(), self.clipboard.as_ref()]
-    }
-}
-
-/// 距上次打开分几段学: 刚用完又呼出多半是接着干同一件事, 隔了很久多半是新的开始.
-pub fn gap_bucket(minutes: i64) -> String {
-    match minutes {
-        ..2 => "under 2 minutes",
-        2..30 => "2 to 30 minutes",
-        30..240 => "30 minutes to 4 hours",
-        _ => "over 4 hours",
-    }
-    .into()
-}
-
-/// 候选在这次打开时本地统计以外的信号.
-#[derive(Default)]
-pub struct Signals {
-    /// 最近被摆出来却没被点的次数 (按天衰减).
-    pub skipped: f64,
-    pub in_title: bool,
-    pub running: bool,
-    /// 下载文件夹或桌面上的新文件出现了多少小时.
-    pub fresh_hours: Option<f64>,
-    /// 以下来自活动时间线 (`library::timeline`), 都按距今衰减: 自己或里面的文件最近一次被改有多近 (0 到 1),
-    /// 在前台停了多少分钟, 最近一次启动有多近 (0 到 1), 和最近活动过的路径有多近 (0 到 1),
-    /// 出现最近这些事之后打开它的比例 (0 到 1).
-    pub modified: f64,
-    pub focused_minutes: f64,
-    pub started: f64,
-    pub nearby: f64,
-    pub after_events: f64,
-}
 
 const MINUTE: i64 = 60_000;
 const DAY: i64 = 86_400_000;
@@ -118,13 +29,11 @@ const SESSION_START: usize = usize::MAX;
 const MAX_EXPONENT: f64 = 500.;
 
 /// 一次启动. key 是目标的比较键 (见 `key`); week_minute 是启动时本地时间在一周里的分钟数, 周一 0 点为 0.
-/// facets 是从 QRun 打开时那次打开的情境, 系统来源的启动没有.
 #[derive(Clone)]
 pub struct Launch {
     pub key: String,
     pub at: i64,
     pub week_minute: u16,
-    pub facets: Option<Facets>,
 }
 
 /// 同一目标在不同来源里大小写可能不同, 统一成小写比较.
@@ -132,9 +41,14 @@ pub fn key(target: &Path) -> String {
     target.to_string_lossy().to_lowercase()
 }
 
-/// 比较键的扩展名 (已是小写); 文件夹和没有扩展名的为空.
-fn extension(key: &str) -> String {
-    Path::new(key).extension().map_or(String::new(), |ext| ext.to_string_lossy().into_owned())
+/// 距上次打开分几段: 刚用完又呼出多半是接着干同一件事, 隔了很久多半是新的开始.
+pub fn gap_bucket(minutes: i64) -> &'static str {
+    match minutes {
+        ..2 => "under 2 minutes",
+        2..30 => "2 to 30 minutes",
+        30..240 => "30 minutes to 4 hours",
+        _ => "over 4 hours",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -171,6 +85,7 @@ struct Stats {
 
 /// 从启动记录累积出的统计. 记录权重按 2^((at - base) / 半衰期) 放大后累加, 查询时统一乘回 2^(-(now - base) / 半衰期),
 /// 这样新增一条记录不用把所有旧记录重新衰减一遍.
+#[derive(Clone)]
 pub struct Model {
     tuning: Tuning,
     kernel: [f64; (2 * KERNEL_REACH + 1) as usize],
@@ -183,15 +98,11 @@ pub struct Model {
     transitions: HashMap<(usize, usize), f64>,
     /// 上一个 -> 它之后接着开的总次数.
     followed: HashMap<usize, f64>,
-    /// (情境下标, 情境值) -> 这种情境下的总次数和各目标的次数; 下标按 `Facets::values` 的顺序.
-    facets: HashMap<(usize, String), (f64, HashMap<usize, f64>)>,
-    /// 各文件类型 (扩展名, 没有的为空) 被打开的次数; 没打开过的东西也能按常开的类型排.
-    extensions: HashMap<String, f64>,
     last: Option<(usize, i64)>,
 }
 
 impl Model {
-    fn new(tuning: Tuning) -> Self {
+    pub fn new(tuning: Tuning) -> Self {
         let mut kernel = [0.; (2 * KERNEL_REACH + 1) as usize];
         for (ix, weight) in kernel.iter_mut().enumerate() {
             let offset = ix as f64 - KERNEL_REACH as f64;
@@ -209,8 +120,6 @@ impl Model {
             all: Stats::default(),
             transitions: HashMap::new(),
             followed: HashMap::new(),
-            facets: HashMap::new(),
-            extensions: HashMap::new(),
             last: None,
         }
     }
@@ -252,58 +161,21 @@ impl Model {
                 stats.hours[(hour + offset).rem_euclid(24) as usize] += weight * k;
             }
         }
-        *self.extensions.entry(extension(&launch.key)).or_default() += weight;
         let prev = self.prev(launch.at);
         *self.transitions.entry((prev, ix)).or_default() += weight;
         *self.followed.entry(prev).or_default() += weight;
-        if let Some(facets) = &launch.facets {
-            for (facet, value) in facets.values().into_iter().enumerate() {
-                if let Some(value) = value {
-                    let (total, targets) = self.facets.entry((facet, value.clone())).or_default();
-                    *total += weight;
-                    *targets.entry(ix).or_default() += weight;
-                }
-            }
-        }
         self.last = Some((ix, launch.at));
     }
 
-    /// 各候选的特征; jev 一项为 0, 有 Jev 结果时由调用方用 `set_jev` 填上.
-    pub fn features<'a>(
+    /// 各候选的四项和它在所有打开里的占比 P(i).
+    pub fn base_terms<'a>(
         &self,
+        keys: impl IntoIterator<Item = &'a str>,
         now: i64,
         week_minute: u16,
-        facets: &Facets,
-        candidates: impl IntoIterator<Item = (&'a str, &'a Signals)>,
-    ) -> Vec<Features> {
+    ) -> Vec<([f64; 4], f64)> {
         let context = self.context(now, week_minute);
-        candidates
-            .into_iter()
-            .map(|(key, signals)| {
-                let ix = self.index.get(key).copied();
-                let mut x = [0.; FEATURES.len()];
-                let (base, p_target) = self.base_terms(ix, &context);
-                x[..BASE_TERMS].copy_from_slice(&base);
-                for (facet, value) in facets.values().into_iter().enumerate() {
-                    if let Some(value) = value {
-                        x[BASE_TERMS + facet] = self.facet_lift(facet, value, ix, p_target, context.decay);
-                    }
-                }
-                x[SKIPPED] = signals.skipped;
-                x[IN_TITLE] = signals.in_title as u8 as f64;
-                x[RUNNING] = signals.running as u8 as f64;
-                // 新文件刚出现时最可能马上要开, 一天后影响减到约三分之一
-                x[FRESH] = signals.fresh_hours.map_or(0., |hours| (-hours / 24.).exp());
-                x[MODIFIED] = signals.modified;
-                // 停了几秒和停了一小时差别大, 一小时和两小时差别小
-                x[FOCUSED] = signals.focused_minutes.ln_1p();
-                x[STARTED] = signals.started;
-                x[NEARBY] = signals.nearby;
-                x[AFTER_EVENTS] = signals.after_events;
-                x[EXTENSION] = self.extension_share(key, &context);
-                x
-            })
-            .collect()
+        keys.into_iter().map(|key| self.terms(self.index.get(key).copied(), &context)).collect()
     }
 
     /// 记录里这个目标最常被打开的几个钟点, 从多到少; 给 Jev 看的习惯摘要.
@@ -328,38 +200,13 @@ impl Model {
         next.into_iter().take(n).map(|(ix, _)| keys[&ix]).collect()
     }
 
-    /// ln 这类文件 (同扩展名) 占所有打开的比例, 向均匀分布平滑.
-    fn extension_share(&self, key: &str, context: &Context) -> f64 {
-        let smoothing = PARAMS.predict.smoothing;
-        let count = self.extensions.get(&extension(key)).map_or(0., |v| v * context.decay);
-        let total = self.all.count * context.decay;
-        ((count + smoothing / (self.extensions.len() + 1) as f64) / (total + smoothing)).ln()
-    }
-
-    fn facet_lift(&self, facet: usize, value: &str, ix: Option<usize>, p_target: f64, decay: f64) -> f64 {
-        let smoothing = PARAMS.predict.smoothing;
-        let (total, count) = self.facets.get(&(facet, value.to_string())).map_or((0., 0.), |(total, targets)| {
-            (*total * decay, ix.and_then(|ix| targets.get(&ix)).map_or(0., |v| v * decay))
-        });
-        let p = (count + smoothing * p_target) / (total + smoothing);
-        (p / p_target).ln()
-    }
-
     fn rebase(&mut self, base: i64) {
         let factor = (-((base - self.base) as f64) / self.half_life_ms).exp2();
         for stats in self.targets.iter_mut().chain(std::iter::once(&mut self.all)) {
             stats.count *= factor;
             stats.days.iter_mut().chain(stats.hours.iter_mut()).for_each(|v| *v *= factor);
         }
-        self.transitions
-            .values_mut()
-            .chain(self.followed.values_mut())
-            .chain(self.extensions.values_mut())
-            .for_each(|v| *v *= factor);
-        for (total, targets) in self.facets.values_mut() {
-            *total *= factor;
-            targets.values_mut().for_each(|v| *v *= factor);
-        }
+        self.transitions.values_mut().chain(self.followed.values_mut()).for_each(|v| *v *= factor);
         self.base = base;
     }
 
@@ -391,7 +238,7 @@ impl Model {
     }
 
     /// 朴素贝叶斯的四项和候选的整体占比 P(i).
-    fn base_terms(&self, ix: Option<usize>, context: &Context) -> ([f64; BASE_TERMS], f64) {
+    fn terms(&self, ix: Option<usize>, context: &Context) -> ([f64; 4], f64) {
         let smoothing = PARAMS.predict.smoothing;
         let stats = ix.map(|ix| &self.targets[ix]);
         let count = stats.map_or(0., |s| s.count * context.decay);
@@ -409,75 +256,8 @@ impl Model {
 
     /// 回放调参只比较记录统计本身, 四项等权相加.
     fn score(&self, ix: Option<usize>, context: &Context) -> f64 {
-        self.base_terms(ix, context).0.iter().sum()
+        self.terms(ix, context).0.iter().sum()
     }
-}
-
-/// Jev 给的概率填进特征: ln(p + jev_smoothing). 加上平滑, Jev 给 0 的候选扣分有限, 本地记录很强时仍能排上来,
-/// 不是一票否决.
-pub fn set_jev(x: &mut Features, probability: f64) {
-    x[JEV] = (probability + PARAMS.learn.jev_smoothing).ln();
-}
-
-/// 各特征的权重, 一套权重同时用于开和不开 Jev: 没有 Jev 结果时 jev 一项不参与打分, 也不参与这次学习, 权重原样保留.
-/// grad_sq 是各特征历次梯度的平方和 (AdaGrad), 学得越多步子越小, 量级大的特征也不会被拽得更多.
-#[derive(Clone)]
-pub struct Weights {
-    pub value: Features,
-    pub grad_sq: Features,
-}
-
-impl Weights {
-    /// 起步以记录打分为主 (前四项为 1), Jev 一项起步就高; params.json 的 initial 里给了的按它, 其余从 0 开始学.
-    /// 学习时也往这里回拉.
-    pub fn initial() -> Self {
-        Self { value: initial_values(), grad_sq: [0.; FEATURES.len()] }
-    }
-
-    pub fn score(&self, x: &Features, with_jev: bool) -> f64 {
-        self.value.iter().zip(x).enumerate().filter(|(ix, _)| with_jev || *ix != JEV).map(|(_, (w, v))| w * v).sum()
-    }
-
-    /// 一次打开的反馈: rows 是这次参与比较的候选, chosen 是被点的下标, shares 是各行算作反例的分量
-    /// (被点的那行为 1; 离被点的越远, 越可能没被看到, 分量越小).
-    /// 按加权 softmax 交叉熵走一步 (AdaGrad 步长), 往起步值回拉的 l2 也算在这一步的梯度里: 样本少时不被个别点击带偏.
-    /// 回拉若在步长之外每次按固定比例拉, 步长随学习次数变小后回拉占上风, 学到的会一点点退回起步值;
-    /// 放进梯度后两者一起缩小, 权重停在数据支持的位置, 越用越准. Jev 一项不低于 jev_floor, 它始终是比重高的一环.
-    pub fn learn(&mut self, rows: &[Features], shares: &[f64], chosen: usize, with_jev: bool) {
-        let scores: Vec<f64> = rows.iter().map(|x| self.score(x, with_jev)).collect();
-        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let exp: Vec<f64> = scores.iter().zip(shares).map(|(s, share)| share * (s - max).exp()).collect();
-        let sum: f64 = exp.iter().sum();
-        let initial = initial_values();
-        let learn = &PARAMS.learn;
-        for feature in 0..FEATURES.len() {
-            if feature == JEV && !with_jev {
-                continue;
-            }
-            let expected: f64 = rows.iter().zip(&exp).map(|(x, e)| x[feature] * e / sum).sum();
-            let gradient = rows[chosen][feature] - expected - learn.l2 * (self.value[feature] - initial[feature]);
-            self.grad_sq[feature] += gradient * gradient;
-            if self.grad_sq[feature] > 0. {
-                self.value[feature] += learn.rate * gradient / self.grad_sq[feature].sqrt();
-            }
-        }
-        self.value[JEV] = self.value[JEV].max(learn.jev_floor);
-        // SKIPPED 之前都是"记录显示现在该开它"的证据, 被点的目标常因记录少而这几项偏低, 权重可以压到不看, 但变负就成了越匹配越靠后
-        for weight in &mut self.value[..SKIPPED] {
-            *weight = weight.max(learn.evidence_floor);
-        }
-    }
-}
-
-fn initial_values() -> Features {
-    let mut w = [0.; FEATURES.len()];
-    w[..BASE_TERMS].fill(1.);
-    w[JEV] = PARAMS.learn.jev_initial;
-    for (name, &value) in &PARAMS.learn.initial {
-        let ix = FEATURES.iter().position(|f| f == name).expect("params.json learn.initial 里是已知特征");
-        w[ix] = value;
-    }
-    w
 }
 
 struct Context {

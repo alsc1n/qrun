@@ -10,7 +10,7 @@ use std::time::Duration;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use super::{Library, is_own, now_ms, own_dirs};
+use super::{Library, activity, is_own, now_ms, own_dirs};
 use crate::model::predict;
 use crate::params::PARAMS;
 use crate::storage;
@@ -127,6 +127,11 @@ impl Timeline {
             .filter(|event| event.end >= since)
             .collect();
         Ok(Self { events, bursts: HashMap::new(), own_dirs: own_dirs(), dirty: false, archived })
+    }
+
+    /// 回放用: 用历史里某一刻之前的事件组一段时间线.
+    pub(super) fn of_events(events: VecDeque<Event>) -> Self {
+        Self { events, bursts: HashMap::new(), own_dirs: Vec::new(), dirty: false, archived: 0 }
     }
 
     /// 最近 n 条, 早的在前.
@@ -260,7 +265,18 @@ impl Library {
     pub fn record(&mut self, what: What) {
         let now = now_ms();
         match what {
-            What::Focus { .. } => self.timeline.focus(what, now),
+            What::Focus { .. } => {
+                self.timeline.focus(what, now);
+                // 换到一个新窗口时看它是不是刚由用户开的程序 (呼出 QRun 后从任务栏开的也要记账)
+                if self.timeline.events.back().is_some_and(|e| e.start == now) {
+                    let since = now - PARAMS.sample.outside_focus_seconds * SECOND;
+                    let recent: Vec<&Event> =
+                        self.timeline.events.iter().rev().take_while(|e| e.end >= since).collect();
+                    for (key, at) in activity::user_started(recent.into_iter().rev()) {
+                        self.learn_outside(&key, at);
+                    }
+                }
+            }
             What::Clipboard { .. } => self.timeline.clipboard(what, now),
             _ => self.timeline.push(what, now, now),
         }

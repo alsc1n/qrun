@@ -15,6 +15,10 @@ pub struct Params {
     pub timeline: Timeline,
     pub history: History,
     pub redact: Redact,
+    pub tags: Tags,
+    pub ledger: Ledger,
+    pub sample: Sample,
+    pub replay: Replay,
     /// 与 installer/qrun.iss 的 AppId 一致, 用来找安装包写入的卸载信息.
     pub installer_app_id: String,
 }
@@ -60,7 +64,7 @@ pub struct Predict {
     pub replay_interval_hours: u64,
 }
 
-/// 从每次打开时的对错里学特征权重 (model::predict::Weights).
+/// 从每次打开时的对错里学特征权重 (model::brain::Weights).
 #[derive(Deserialize)]
 pub struct Learn {
     /// AdaGrad 的基础步长: 每个特征的第一步约这么大, 之后随累计梯度变小.
@@ -70,11 +74,11 @@ pub struct Learn {
     /// Jev 一项的起步权重和学习时的下限.
     pub jev_initial: f64,
     pub jev_floor: f64,
-    /// 记录类特征 (常用度, 钟点, 前后衔接, 情境等, 见 model::predict::SKIPPED 之前) 权重学习时的下限.
+    /// 记录类特征 (程序本身的四项, 情境, 状态, 见 model::brain::SKIPPED 之前) 权重学习时的下限.
     pub evidence_floor: f64,
     /// Jev 特征取 ln(p + 这个值): p 为 0 时不至于一票否决.
     pub jev_smoothing: f64,
-    /// 除前四项和 Jev 外, 不从 0 起步的特征 (特征名见 model::predict::FEATURES).
+    /// 除 Jev 外不从 0 起步的特征 (特征名见 model::brain::FEATURES).
     pub initial: HashMap<String, f64>,
     /// 在"猜你要打开"里点了某个时, 只有它上面最近的这么多个算被跳过.
     pub skip_window: usize,
@@ -157,10 +161,62 @@ pub struct Timeline {
     pub nearby_paths: usize,
     /// 打开 QRun 前多少分钟内发生的事, 算作"出现这些事之后打开了什么".
     pub token_minutes: i64,
-    /// "出现某件事之后打开了什么"的统计每过这么多天减半.
-    pub cooccur_half_life_days: i64,
     /// 给 Jev 看最近多少条活动.
     pub jev_events: usize,
+}
+
+/// 把一次打开时的情况拆成标签 (model::library::tags).
+#[derive(Deserialize)]
+pub struct Tags {
+    /// 一次打开最多多少个情境标签.
+    pub max_context_tags: usize,
+    /// 多少分钟内的复制才算这次打开的剪贴板.
+    pub clip_minutes: i64,
+    /// 剪贴板文字最多取前多少个词当标签.
+    pub clip_words: usize,
+    /// 中文没有空格分词, 一段连续的中文只取前这么多个字当一个词.
+    pub cjk_word_chars: usize,
+    /// 窗口标题最多取多少段, 每段最多多少个字.
+    pub title_tags: usize,
+    pub title_segment_chars: usize,
+    /// 不当标签的常见词 (小写).
+    pub stopwords: Vec<String>,
+    /// 候选的状态从最近活动里按这些门槛判断: 被改过 / 刚启动有多近 (0 到 1, 见 timeline.activity_half_life_minutes),
+    /// 在前台停了多少分钟, 和最近活动的路径有多近 (0 到 1).
+    pub modified: f64,
+    pub focused_minutes: f64,
+    pub started: f64,
+    pub nearby: f64,
+}
+
+/// 标签账 (model::brain::Ledger).
+#[derive(Deserialize)]
+pub struct Ledger {
+    /// 账每过这么多天减半.
+    pub half_life_days: f64,
+    /// 情境标签向 "和平时一样" 平滑的强度 (相当于几次虚拟打开): 见过一两次几乎不动, 多次才明显起作用.
+    pub smoothing: f64,
+    /// 状态向所有程序的平均平滑的强度; 某程序数据少时按平均算.
+    pub state_smoothing: f64,
+    /// 状态的起步倍数: 各程序都还没数据时, 处于这个状态的被打开的可能性按平时的几倍算 (没列的按 1);
+    /// 有了数据就按数据. 刚下载的文件, 刚改过的文件起步就该靠前.
+    pub state_priors: HashMap<String, f64>,
+}
+
+/// 哪些打开算学习的样本.
+#[derive(Deserialize)]
+pub struct Sample {
+    /// 呼出 QRun 后这么多分钟内从别处 (任务栏, 资源管理器) 打开的, 也算这次想开的.
+    pub outside_minutes: i64,
+    /// 程序启动后这么多秒内到了前台, 才算用户自己开的 (后台拉起的程序不会到前台).
+    pub outside_focus_seconds: i64,
+}
+
+/// 回放 (model::library::replay).
+#[derive(Deserialize)]
+pub struct Replay {
+    /// 之前打开过的目标最多取最近多少个当候选, 近似线上的系统最近记录.
+    pub candidates: usize,
 }
 
 /// 长期保留的活动记录 (model::library::timeline 归档进 history), 回放用.

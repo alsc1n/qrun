@@ -5,8 +5,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, OpenFlags, Transaction};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -38,6 +39,12 @@ pub fn prepare() -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录 {} 失败: {e}", dir.display()))?;
     DIR.set(dir).expect("storage::prepare 只调一次");
     Ok(())
+}
+
+/// 只读用 (`qrun.exe --replay`): 定下数据目录, 不搬数据也不建目录.
+pub fn locate() {
+    let dir = install::value(DATA_DIR_VALUE).map_or_else(default_dir, PathBuf::from);
+    DIR.set(dir).expect("storage::locate 只调一次");
 }
 
 /// 数据目录.
@@ -202,6 +209,13 @@ pub fn open_db(version: u32, migrate: fn(u32, &Transaction) -> rusqlite::Result<
         tx.pragma_update(None, "user_version", version).map_err(fail)?;
         tx.commit().map_err(fail)?;
     }
+    Ok(db)
+}
+
+/// 只读打开库 (回放用, 可在后台线程); 版本已由 `open_db` 迁移好. 正在运行的 QRun 写库时等它写完.
+pub fn open_db_read_only() -> rusqlite::Result<Connection> {
+    let db = Connection::open_with_flags(path(DB_FILE), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_secs(10))?;
     Ok(db)
 }
 

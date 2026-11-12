@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
@@ -65,6 +66,11 @@ pub fn local_time() -> String {
 }
 
 /// 程序没有控制台, 出错时用系统消息框告诉用户.
+/// 本程序没有控制台 (windows 子系统); 命令行调用时接到启动它的终端上, println 才看得到.
+pub fn attach_console() {
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
 pub fn error_box(message: &str) {
     let message = wide(message);
     unsafe { MessageBoxW(None, PCWSTR(message.as_ptr()), w!("QRun"), MB_ICONERROR | MB_OK) };
