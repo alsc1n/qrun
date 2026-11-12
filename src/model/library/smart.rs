@@ -452,6 +452,23 @@ impl Library {
         log::debug!("learned outside open of {key}");
     }
 
+    /// 重置推荐: 清除活动记录, 学到的账和权重, 从头学. 启动记录留着 (分组按点击次数排序和最常用要用).
+    /// 活动记录一起清掉, 否则账空了会被回放从历史再建出来.
+    pub fn reset_recommendation(&mut self) {
+        self.clear_activity();
+        if let Err(e) = self.db.execute_batch("DELETE FROM ledger; DELETE FROM weights;") {
+            storage::db_save_failed(&e);
+            return;
+        }
+        self.ledger = Ledger::default();
+        self.weights = Weights::initial();
+    }
+
+    /// Jev 的平均考核得分和考核次数 (按半衰期衰减); 还没考核过为 None.
+    pub fn jev_score(&self) -> Option<(f64, f64)> {
+        self.ledger.jev_score(now_ms())
+    }
+
     /// 账里变了的各笔写进库.
     pub(super) fn save_ledger(&mut self) {
         let entries = self.ledger.take_changed();

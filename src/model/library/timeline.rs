@@ -372,4 +372,26 @@ impl Library {
             storage::db_save_failed(&e);
         }
     }
+
+    /// 清除活动记录: 时间线和归档, 每次打开时的情境和摆出的候选, 跳过记录. 学到的账和权重, 启动记录留着.
+    /// 这次打开也一并丢掉 (它的那行已删), 下次打开重新记.
+    pub fn clear_activity(&mut self) {
+        let result = self.db.execute_batch(
+            "UPDATE launches SET open_id = NULL;
+             DELETE FROM shown;
+             DELETE FROM opens;
+             DELETE FROM skips;
+             DELETE FROM history;
+             DELETE FROM timeline;",
+        );
+        if let Err(e) = result {
+            storage::db_save_failed(&e);
+            return;
+        }
+        self.timeline.events.clear();
+        self.timeline.bursts.clear();
+        self.timeline.dirty = false;
+        self.open = None;
+        self.previous_open = None;
+    }
 }

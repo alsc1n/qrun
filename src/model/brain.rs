@@ -267,6 +267,12 @@ impl Ledger {
             / (self.jev_judged.value(now) + p.trust_smoothing)
     }
 
+    /// Jev 的平均得分 (不平滑) 和考核次数; 还没考核过为 None.
+    pub fn jev_score(&self, now: i64) -> Option<(f64, f64)> {
+        let judged = self.jev_judged.value(now);
+        (judged > 0.).then(|| (self.jev_credit.value(now) / judged, judged))
+    }
+
     /// 给 Jev 看的习惯: 这次的情境标签里, 出现时开过 key 至少 evidence_min 次的, 按次数从多到少最多 evidence_tags 条,
     /// 每条是 (标签, 出现时开它的次数, 出现过的打开次数).
     pub fn evidence<'a>(&self, tags: &'a [String], key: &str, now: i64) -> Vec<(&'a str, f64, f64)> {

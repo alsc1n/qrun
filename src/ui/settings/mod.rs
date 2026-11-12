@@ -5,6 +5,7 @@ mod appearance;
 mod data;
 mod dock;
 mod general;
+mod privacy;
 mod smart;
 
 use gpui_kit::component::ActiveTheme;
@@ -29,6 +30,7 @@ pub struct SettingsView {
     icon_size: Entity<SliderState>,
     dock_sliders: dock::DockSliders,
     smart_sliders: smart::SmartSliders,
+    retention: Entity<SliderState>,
     rolan_import: data::Status,
     data_location: data::Status,
     data_dir: Entity<InputState>,
@@ -49,6 +51,7 @@ impl SettingsView {
         let icon_size = appearance::icon_size_slider(&settings, cx);
         let dock_sliders = dock::sliders(&settings, cx);
         let smart_sliders = smart::sliders(&settings, cx);
+        let retention = privacy::retention_slider(&settings, cx);
         let rolan_import = cx.new(|_| None);
         let data_location = cx.new(|_| None);
         let data_dir = data::location_input(&data_location, window, cx);
@@ -68,6 +71,7 @@ impl SettingsView {
             icon_size,
             dock_sliders,
             smart_sliders,
+            retention,
             rolan_import,
             data_location,
             data_dir,
@@ -84,6 +88,7 @@ impl Render for SettingsView {
             general::page(&self.settings),
             appearance::page(&self.settings, &self.font_select, &self.icon_size, cx),
             smart::page(&self.settings, &self.library, &self.smart_sliders, cx),
+            privacy::page(&self.settings, &self.library, &self.retention, cx),
             dock::page(&self.settings, &self.dock_sliders, cx),
             data::page(&self.library, &self.rolan_import, &self.data_dir, &self.data_location, cx),
             about::page(&self.settings, &self.updater, cx),

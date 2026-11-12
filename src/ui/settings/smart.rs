@@ -121,24 +121,27 @@ pub fn page(settings: &Entity<Settings>, library: &Entity<Library>, sliders: &Sm
                         .disabled(off)
                         .description("通常无需修改."),
                 )
-                .item(
-                    SettingItem::new("密钥", jev_key)
-                        .layout(Axis::Vertical)
-                        .disabled(off)
-                        .description("填写后, 当前窗口和最近使用记录将发送至 Jev 用于推荐."),
-                )
+                .item(SettingItem::new("密钥", jev_key).layout(Axis::Vertical).disabled(off).description(
+                    "填写后, 当前窗口和最近使用记录将发送至 Jev 用于推荐. 发送前已在本机脱敏, \
+                             密钥, 密码, 手机号, 证件号等不会发出.",
+                ))
                 .item(jev_log(library, cx)),
         )
 }
 
-/// 最近一次调用 Jev 的结果; 每次失败都写进日志, 按钮打开日志文件.
+/// 最近一次调用 Jev 的结果和它的考核得分; 每次失败都写进日志, 按钮打开日志文件.
 fn jev_log(library: &Entity<Library>, cx: &App) -> SettingItem {
+    let library = library.read(cx);
     // at 形如 2026-11-05 14:03:21.123, 只显示时分
-    let description = match library.read(cx).jev_last() {
+    let mut description = match library.jev_last() {
         None => "尚未调用.".to_string(),
         Some((at, Ok(()))) => format!("上次调用 {} 成功.", &at[11..16]),
         Some((at, Err(e))) => format!("上次调用 {} 失败: {e}", &at[11..16]),
     };
+    // 打开的在 Jev 排序里第一得 1 分, 每后一名减半; 得分越高推荐越听它的
+    if let Some((score, count)) = library.jev_score() {
+        description.push_str(&format!(" 排序得分 {score:.2} (近 {count:.0} 次), 得分越高推荐越参考 Jev."));
+    }
     let open = SettingField::render(|_, _, _| {
         Button::new("jev-log")
             .outline()

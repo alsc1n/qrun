@@ -24,14 +24,24 @@
 - **Recommended page** (can be turned off in settings): pinned before the groups, showing what you are likely to open next, your most used items, and the
   files, folders and programs Windows recently opened. Predictions use the local launch history (frequency, hour of
   day, weekday or weekend, what you usually open next) and the situation when the panel opens (foreground program and
-  window title, clipboard type, running programs), and learn their weights from what you pick or skip each time.
-  Optionally, enter an API base URL and key in settings to let the Jev decision model weigh in. While recommendations
-  are on, QRun also keeps a local activity timeline of the last 2 hours (foreground window and title, programs starting
-  and exiting, file changes in your user folder and on other local drives, clipboard type, ports starting to listen).
-  Recommended files and folders come only from what you opened (Windows recent items and each program's jump list);
-  file changes just move those up, so logs, databases and caches written by programs are never recommended. It records
-  paths, names and times only, never file or clipboard contents, lives in `qrun.db`, and anything older than
-  2 hours is dropped.
+  window title, what you just copied, running programs, recent activity). Each situation is split into tags (the
+  start of the copied text, the foreground program, parts of the window title, what just happened), and QRun keeps a
+  ledger of what you opened under each tag, so after copying SQL a few times it learns to put your database client
+  first. The ledger and the weights are stored in `qrun.db` and keep accumulating; old habits fade with a 30-day
+  half-life. Optionally, enter an API base URL and key in settings to let the Jev decision model weigh in: it sees
+  your own habits for each candidate, sorts the top 20 and tags the situation (what you copied, what you are doing),
+  and how much it counts depends on how well it has ranked what you actually opened.
+  While recommendations are on, QRun keeps a local activity record (foreground window and title, programs starting and
+  exiting, file changes in your user folder and on other local drives, the start of copied text, ports starting to
+  listen). Recommended files and folders come only from what you opened (Windows recent items and each program's jump
+  list); file changes just move those up, so logs, databases and caches written by programs are never recommended. It
+  never reads file contents. **All of this stays on your computer and is never uploaded to any server or cloud.** The
+  only exception is the Jev key: if you enter one yourself, a redacted summary is sent to Jev; without a key nothing
+  leaves your computer. Copied text, window titles and search terms are redacted on this computer before they are
+  stored or sent: keys, tokens, passwords, emails, phone, ID and bank card numbers are replaced with placeholders, and
+  content from password managers is not read. The Privacy page of settings turns each kind of collection on or off,
+  sets how many days the activity record is kept (60 by default; learned habits stay), and can clear the activity
+  record or reset recommendations.
 - **Search**: filter by name across all groups, ranked by what you are most likely to open now; press Enter to open the
   first match.
 - **Item menu**: run as administrator, open with, open file location, copy path, copy file, edit (name, target,
@@ -45,7 +55,7 @@
   mouse leaves and slides back when the mouse touches that edge.
 - **System tray**: the panel stays out of the taskbar; click the tray icon to show it, right-click for the menu.
 - **Settings window**: open it from the gear button or the tray menu. Pages: General (start with Windows, single or
-  double click to launch, switch groups on hover, always on top, hide after launch, skip duplicate names, drag programs out as shortcuts or files), Appearance (font, horizontal or vertical tabs, icon size, opacity), Recommended, Docking, Data (data folder, import from Rolan) and About (version, updates).
+  double click to launch, switch groups on hover, always on top, hide after launch, skip duplicate names, drag programs out as shortcuts or files), Appearance (font, horizontal or vertical tabs, icon size, opacity), Recommended, Privacy, Docking, Data (data folder, import from Rolan) and About (version, updates).
 - **Start with Windows**: registered under the current user's `Run` registry key, only when you turn it on.
 - **Updates**: checks for new releases at startup and every 24 hours (GitHub first, then the
   [CNB mirror](https://cnb.cool/alsc1n/qrun) for users in China). The installed version downloads the installer,
@@ -89,7 +99,9 @@ which are normally changed from the settings window:
 | `smart.enabled` | Recommendations on or off. When off, the recommended page is hidden, Windows recent items are not read, no activity timeline is kept, nothing is learned, Jev is not called and search matches by name only; learned data is kept |
 | `smart.predict` / `smart.frequent` / `smart.recent_files` / `smart.recent_folders` / `smart.recent_programs` | How many entries each recommended page section shows at most; 0 hides the section |
 | `smart.jev_base_url` | Base URL of the Jev API, TypeSafe's official `https://api.typesafe.ai/v1` by default; requests go to `{base}/systemone` |
-| `smart.jev_key` | API key for the Jev decision model; an empty URL or key turns Jev off. When set, the foreground program and window title, recent launches and the candidate list are sent to the base URL |
+| `smart.jev_key` | API key for the Jev decision model; an empty URL or key turns Jev off. When set, the redacted situation (foreground program and window title, recent activity including the start of copied text), recent launches and the top candidates with your habits are sent to the base URL |
+| `smart.collect.window` / `.clipboard` / `.processes` / `.files` / `.new_files` / `.system_recent` | What recommendations collect: foreground and open windows, the start of copied text (off: only its type), programs starting and exiting and listening ports, file changes, new files in Downloads and on the desktop, Windows recent items and jump lists (off: the recent sections of the recommended page are hidden). All on by default |
+| `smart.retention_days` | How many days the activity record is kept, 60 by default; learned habits are kept regardless |
 | `dock.enabled` | Whether edge docking is on |
 | `dock.lock_position` | Lock the docked panel: it cannot be dragged away, and launching QRun again does not undock it |
 | `dock.snap_distance` | How close to an edge (logical pixels) the panel must be dropped to dock |
