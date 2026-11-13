@@ -71,6 +71,7 @@ pub fn run(settings: Settings, library: Library, cx: &mut App) {
     cx.on_action(|_: &OpenUpdate, cx| open_update(cx));
     load_fonts(cx);
     follow_font(&settings, cx);
+    follow_ignore(&settings, &library, cx);
 
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, fit_screen(saved, PANEL_MIN_SIZE, cx), cx))),
@@ -123,6 +124,21 @@ fn follow_font(settings: &Entity<Settings>, cx: &mut App) {
         if font != applied {
             apply_font(&font, &system, cx);
             applied = font;
+        }
+    })
+    .detach();
+}
+
+/// 设置里不推荐的目录和扩展名交给库, 改了就跟着换.
+fn follow_ignore(settings: &Entity<Settings>, library: &Entity<Library>, cx: &mut App) {
+    let mut applied = settings.read(cx).smart.ignore.clone();
+    library.update(cx, |lib, cx| lib.set_ignore(applied.clone(), cx));
+    let library = library.clone();
+    cx.observe(settings, move |settings, cx| {
+        let ignore = settings.read(cx).smart.ignore.clone();
+        if ignore != applied {
+            library.update(cx, |lib, cx| lib.set_ignore(ignore.clone(), cx));
+            applied = ignore;
         }
     })
     .detach();

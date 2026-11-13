@@ -14,6 +14,7 @@ pub struct Params {
     pub jev: Jev,
     pub timeline: Timeline,
     pub history: History,
+    pub ignore: Ignore,
     pub redact: Redact,
     pub tags: Tags,
     pub ledger: Ledger,
@@ -240,6 +241,17 @@ pub struct History {
     pub archive_after_minutes: i64,
     /// 设置里 "保留天数" 的默认值.
     pub retention_days: u32,
+}
+
+/// 不当推荐的东西 (model::library::Library::ignored), 都是程序自己生成, 平时在资源管理器里看不到或不会去开的.
+/// dir_names (临时目录, 缓存, 回收站, 依赖和版本库目录) 和 extensions (临时文件, 备份, 锁文件, 没下完的下载, 崩溃转储)
+/// 是设置里 "不推荐的目录 / 扩展名" 的默认值, 用户可增删. name_prefixes (Office 的 ~$xxx, LibreOffice / WPS 的
+/// .~lock.xxx#) 和隐藏或系统属性固定排除. 都不分大小写. 点开头的目录 (.codex, .claude) 在资源管理器里看得见, 用户会去开, 不算.
+#[derive(Deserialize)]
+pub struct Ignore {
+    pub dir_names: Vec<String>,
+    pub extensions: Vec<String>,
+    pub name_prefixes: Vec<String>,
 }
 
 /// 脱敏 (model::redact) 和剪贴板读取.

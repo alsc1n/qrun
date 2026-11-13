@@ -15,6 +15,7 @@ use super::brain::{Ledger, Weights};
 use super::predict::{self, Launch, Model, Tuning};
 use super::redact::redact;
 use super::rolan;
+use crate::model::settings::Ignore;
 use crate::params::PARAMS;
 use crate::storage;
 
@@ -202,6 +203,8 @@ pub struct Library {
     db: Connection,
     /// 定时调程序本身统计的参数 (库里还没有账时先回放建账) 的后台任务.
     tuning: Task<()>,
+    /// 设置里不推荐的目录和扩展名, 由 app 跟着设置更新 (`set_ignore`).
+    ignore: Ignore,
 }
 
 /// 系统最近记录里的一条: 打开过的目标和最后一次打开的时间 (Unix 毫秒).
@@ -341,6 +344,7 @@ impl Library {
             timeline,
             db,
             tuning: Task::ready(()),
+            ignore: Ignore::default(),
         };
         // 首次运行给一个默认分组
         let first_run = library.groups.is_empty();
@@ -613,7 +617,7 @@ impl Library {
     /// QRun 自己目录下的文件既不记也不当候选.
     pub fn sync_system(&mut self, mut observed: Vec<Observed>, cx: &mut Context<Self>) {
         let dirs = own_dirs();
-        observed.retain(|entry| !is_own(&predict::key(&entry.target), &dirs));
+        observed.retain(|entry| !is_own(&predict::key(&entry.target), &dirs) && !self.ignored(&entry.target));
         match self.write_observed(&observed) {
             Ok(added) if !added.is_empty() => {
                 // 系统记录的时间可能早于已有记录, 不能接着往后加, 重新读一遍按时间排好
@@ -629,10 +633,23 @@ impl Library {
         cx.notify();
     }
 
+    /// 设置里不推荐的目录和扩展名变了. 已读到的系统记录里命中的随即去掉, 推荐页下次排序时生效.
+    pub fn set_ignore(&mut self, ignore: Ignore, cx: &mut Context<Self>) {
+        self.ignore = ignore;
+        let rules = &self.ignore;
+        self.system.retain(|entry| !ignored(&entry.target, rules));
+        cx.notify();
+    }
+
+    /// target 平时看不到, 不当推荐 (见 `ignored`).
+    pub fn ignored(&self, target: &Path) -> bool {
+        ignored(target, &self.ignore)
+    }
+
     /// 换上刚扫到的新文件 (其余系统记录不动), 返回有没有之前没见过的.
     pub fn sync_new_files(&mut self, mut found: Vec<Observed>) -> bool {
         let dirs = own_dirs();
-        found.retain(|entry| !is_own(&predict::key(&entry.target), &dirs));
+        found.retain(|entry| !is_own(&predict::key(&entry.target), &dirs) && !self.ignored(&entry.target));
         let known: HashSet<String> =
             self.system.iter().filter(|e| e.kind == NEW_FILE).map(|e| predict::key(&e.target)).collect();
         let appeared = found.iter().any(|e| !known.contains(&predict::key(&e.target)));
@@ -937,6 +954,26 @@ fn own_dirs() -> Vec<String> {
         .collect();
     dirs.dedup();
     dirs
+}
+
+/// 平时看不到的东西不当推荐 (不显示, 不当候选, 不记成系统来源的启动): 设置里不推荐的目录和扩展名, 加上固定排除的
+/// 锁文件 (params.json 的 ignore.name_prefixes) 和隐藏, 系统文件. 隐藏属性只看目标本身: AppData 是隐藏的,
+/// 但装在里面的程序 (各种用户级安装) 照常推荐.
+fn ignored(target: &Path, rules: &Ignore) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+    let lower = |s: &std::ffi::OsStr| s.to_string_lossy().to_lowercase();
+    let key = format!("{}\\", predict::key(target));
+    let in_dir = rules.dirs.iter().any(|dir| match dir.contains(['\\', '/', ':']) {
+        true => key.starts_with(&format!("{}\\", predict::key(Path::new(dir)).trim_end_matches('\\'))),
+        false => target.components().any(|c| lower(c.as_os_str()) == *dir),
+    });
+    let by_extension = target.extension().is_some_and(|ext| rules.extensions.contains(&lower(ext)));
+    let prefixes = &PARAMS.ignore.name_prefixes;
+    let by_name = target.file_name().is_some_and(|name| prefixes.iter().any(|x| lower(name).starts_with(x)));
+    // shell:AppsFolder 这类不是文件路径的读不到属性, 按不隐藏算
+    let hidden = std::fs::metadata(target).is_ok_and(|m| m.file_attributes() & HIDDEN_OR_SYSTEM != 0);
+    in_dir || by_extension || by_name || hidden
 }
 
 /// 比较键 key 是不是 QRun 自己的目录或其中的文件.

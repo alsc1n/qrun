@@ -120,6 +120,17 @@
   "replay": {
     "candidates": 300
   },
+  "ignore": {
+    "dir_names": [
+      "temp", "tmp", "cache", "caches", "inetcache", "crashdumps", "crashpad", "node_modules", "__pycache__", ".git",
+      "$recycle.bin", "system volume information"
+    ],
+    "extensions": [
+      "tmp", "temp", "bak", "old", "swp", "swo", "lock", "lck", "crdownload", "part", "partial", "download", "dmp",
+      "mdmp", "etl", "pf", "db-journal"
+    ],
+    "name_prefixes": ["~", ".~"]
+  },
   "history": {
     "archive_after_minutes": 10,
     "retention_days": 60

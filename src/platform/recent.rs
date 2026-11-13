@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Read};
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -183,12 +182,10 @@ fn unix_ms(filetime: u64) -> i64 {
     ((filetime - FILETIME_UNIX_EPOCH) / 10_000) as i64
 }
 
-/// 下载文件夹和桌面上 since 之后修改的文件 (不进子目录). 快捷方式, 系统文件, 还没下完的临时文件不算;
-/// 隐藏文件和 . 或 ~ 开头的文件也不算: 文档打开时办公软件旁边生成的锁文件 (LibreOffice / WPS 的 .~lock.xxx#,
-/// Office 的 ~$xxx) 都是这样.
+/// 下载文件夹和桌面上 since 之后修改的文件 (不进子目录). 快捷方式和 desktop.ini 不算新文件;
+/// 临时文件, 锁文件, 隐藏文件由 `library::ignored` 统一滤掉.
 pub fn new_files(since: i64) -> Vec<RecentEntry> {
-    const SKIP: [&str; 6] = ["lnk", "ini", "tmp", "crdownload", "part", "download"];
-    const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+    const SKIP: [&str; 2] = ["lnk", "ini"];
     let mut files = Vec::new();
     for folder in [&FOLDERID_Downloads, &FOLDERID_Desktop] {
         let Ok(entries) = fs::read_dir(known_folder(folder)) else {
@@ -201,9 +198,7 @@ pub fn new_files(since: i64) -> Vec<RecentEntry> {
             };
             let skipped =
                 path.extension().is_some_and(|ext| SKIP.contains(&ext.to_string_lossy().to_lowercase().as_str()));
-            let temporary = entry.file_name().to_string_lossy().starts_with(['.', '~'])
-                || metadata.file_attributes() & HIDDEN_OR_SYSTEM != 0;
-            if !metadata.is_file() || skipped || temporary {
+            if !metadata.is_file() || skipped {
                 continue;
             }
             let Ok(modified) = metadata.modified() else {

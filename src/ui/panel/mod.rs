@@ -200,9 +200,14 @@ impl Panel {
         let collect = self.settings.read(cx).smart.collect;
         let new_since = collect.new_files.then(new_file_since);
         self.read_recent = cx.spawn(async move |this, cx| {
-            let recent =
+            let mut recent =
                 cx.background_executor().spawn(async move { recent::read(collect.system_recent, new_since) }).await;
             this.update(cx, |this, cx| {
+                // 平时看不到的 (卸载程序, 聊天缓存, 锁文件) 不显示也不记
+                let library = this.library.read(cx);
+                for list in [&mut recent.files, &mut recent.folders, &mut recent.programs, &mut recent.new_files] {
+                    list.retain(|e| !library.ignored(&e.target));
+                }
                 let lists = [
                     (&recent.files, "file"),
                     (&recent.folders, "folder"),

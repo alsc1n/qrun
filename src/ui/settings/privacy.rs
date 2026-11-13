@@ -1,15 +1,112 @@
-//! 隐私: 推荐收集哪些信息, 活动记录保留多久, 清除活动记录和重置推荐.
+//! 隐私: 推荐收集哪些信息, 不推荐的目录和扩展名, 活动记录保留多久, 清除活动记录和重置推荐.
 
-use gpui_kit::component::IconName;
-use gpui_kit::component::Sizable;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::setting::{SettingField, SettingGroup, SettingItem, SettingPage};
 use gpui_kit::component::slider::SliderState;
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::{IconName, Sizable, h_flex, v_flex};
 use gpui_kit::*;
 
 use super::{SettingsView, handle, slider, slider_field};
 use crate::model::library::Library;
-use crate::model::settings::{Collect, Settings};
+use crate::model::settings::{Collect, Ignore, Settings};
+
+/// 不推荐的目录和扩展名: 已有的一项一个标签 (点 × 删掉), 下面的输入框打字回车 (或离开输入框) 加成新标签.
+/// 输入框由视图持有, 跨帧保留打了一半的字.
+pub struct IgnoreInputs {
+    dirs: Entity<InputState>,
+    extensions: Entity<InputState>,
+}
+
+/// 一类清单: 读, 改, 扩展名要去掉开头的点.
+#[derive(Clone, Copy)]
+struct IgnoreList {
+    id: &'static str,
+    get: fn(&Ignore) -> &Vec<String>,
+    get_mut: fn(&mut Ignore) -> &mut Vec<String>,
+    extensions: bool,
+}
+
+const DIRS: IgnoreList = IgnoreList { id: "ignore-dir", get: |i| &i.dirs, get_mut: |i| &mut i.dirs, extensions: false };
+const EXTENSIONS: IgnoreList =
+    IgnoreList { id: "ignore-ext", get: |i| &i.extensions, get_mut: |i| &mut i.extensions, extensions: true };
+
+pub fn ignore_inputs(settings: &Entity<Settings>, window: &mut Window, cx: &mut Context<SettingsView>) -> IgnoreInputs {
+    IgnoreInputs {
+        dirs: ignore_input(settings, DIRS, "添加目录名或完整路径, 回车确认", window, cx),
+        extensions: ignore_input(settings, EXTENSIONS, "添加扩展名, 回车确认", window, cx),
+    }
+}
+
+fn ignore_input(
+    settings: &Entity<Settings>,
+    list: IgnoreList,
+    placeholder: &'static str,
+    window: &mut Window,
+    cx: &mut Context<SettingsView>,
+) -> Entity<InputState> {
+    let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+    let settings = settings.clone();
+    cx.subscribe_in(&input, window, move |_, input, event: &InputEvent, window, cx| {
+        if !matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+            return;
+        }
+        let added = parse_list(&input.read(cx).value(), list.extensions);
+        if added.is_empty() {
+            return;
+        }
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+        settings.update(cx, |s, cx| {
+            let current = (list.get)(&s.smart.ignore);
+            let added: Vec<String> = added.into_iter().filter(|item| !current.contains(item)).collect();
+            if !added.is_empty() {
+                s.change(cx, |s| (list.get_mut)(&mut s.smart.ignore).extend(added));
+            }
+        });
+    })
+    .detach();
+    input
+}
+
+/// 一次可以加好几个: 逗号 (中英文都行), 分号或空白分开; 转小写, 去重. 扩展名去掉开头的点 (目录名不去, .git 就叫 .git).
+/// 完整路径里可能有空格 (Program Files), 含路径分隔符的整段当一项, 不按空白拆.
+fn parse_list(text: &str, extensions: bool) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    for part in text.split([',', '，', ';', '；', '\n']) {
+        let part = part.trim();
+        let pieces: Vec<&str> = match part.contains(['\\', '/', ':']) {
+            true => vec![part],
+            false => part.split_whitespace().collect(),
+        };
+        for piece in pieces {
+            let item = if extensions { piece.trim_start_matches('.') } else { piece }.to_lowercase();
+            if !item.is_empty() && !items.contains(&item) {
+                items.push(item);
+            }
+        }
+    }
+    items
+}
+
+/// 已有的标签, 每个带 × 删除; 下面是添加用的输入框.
+fn tags_field(settings: &Entity<Settings>, input: &Entity<InputState>, list: IgnoreList) -> SettingField<SharedString> {
+    let (settings, input) = (settings.clone(), input.clone());
+    SettingField::render(move |_, _, cx| {
+        let items = (list.get)(&settings.read(cx).smart.ignore).clone();
+        let tags = items.into_iter().enumerate().map(|(ix, item)| {
+            let settings = settings.clone();
+            let remove = item.clone();
+            let delete = Button::new((list.id, ix)).ghost().xsmall().icon(IconName::Close).on_click(move |_, _, cx| {
+                let remove = remove.clone();
+                settings
+                    .update(cx, |s, cx| s.change(cx, |s| (list.get_mut)(&mut s.smart.ignore).retain(|x| *x != remove)));
+            });
+            Tag::secondary().small().child(h_flex().gap_0p5().child(item).child(delete))
+        });
+        v_flex().w_full().gap_2().child(h_flex().flex_wrap().gap_1().children(tags)).child(Input::new(&input).small())
+    })
+}
 
 /// 保留天数的范围.
 const MIN_DAYS: f32 = 7.;
@@ -30,6 +127,7 @@ pub fn page(
     settings: &Entity<Settings>,
     library: &Entity<Library>,
     retention: &Entity<SliderState>,
+    ignore: &IgnoreInputs,
     cx: &App,
 ) -> SettingPage {
     // 关掉推荐时什么都不收集, 各项变灰
@@ -73,6 +171,24 @@ pub fn page(
                     |c| c.system_recent,
                     |c, v| c.system_recent = v,
                 )),
+        )
+        .group(
+            SettingGroup::new()
+                .title("不推荐的文件")
+                .item(
+                    SettingItem::new("目录", tags_field(settings, &ignore.dirs, DIRS))
+                        .layout(Axis::Vertical)
+                        .disabled(off)
+                        .description(
+                            "写名称 (如 temp) 排除所有叫这个名字的目录, 写完整路径 (如 D:\\logs) 只排除这一个.",
+                        ),
+                )
+                .item(
+                    SettingItem::new("扩展名", tags_field(settings, &ignore.extensions, EXTENSIONS))
+                        .layout(Axis::Vertical)
+                        .disabled(off)
+                        .description("隐藏文件和 Office 打开文档时生成的锁文件始终不推荐."),
+                ),
         )
         .group(
             SettingGroup::new()

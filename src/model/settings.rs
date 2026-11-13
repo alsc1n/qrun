@@ -59,6 +59,23 @@ pub struct Smart {
     pub collect: Collect,
     /// 活动记录和每次打开时的情境保留多少天, 更早的删掉.
     pub retention_days: u32,
+    /// 不推荐的目录和扩展名, 用户可增删; 默认取 params.json 的 ignore.
+    pub ignore: Ignore,
+}
+
+/// 不推荐的目录和扩展名 (小写). 目录写名称的, 路径里任一级叫这个名字都不推荐; 写完整路径的, 只排除那个目录和里面的.
+/// 扩展名不带点.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ignore {
+    pub dirs: Vec<String>,
+    pub extensions: Vec<String>,
+}
+
+impl Default for Ignore {
+    fn default() -> Self {
+        Self { dirs: PARAMS.ignore.dir_names.clone(), extensions: PARAMS.ignore.extensions.clone() }
+    }
 }
 
 /// 推荐收集的各类信息, 每类一个开关, 默认都开.
@@ -228,6 +245,7 @@ impl Default for Smart {
             jev_key: String::new(),
             collect: Collect::default(),
             retention_days: PARAMS.history.retention_days,
+            ignore: Ignore::default(),
         }
     }
 }

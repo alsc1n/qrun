@@ -532,7 +532,7 @@ impl Library {
                 list.push(ranked(key, entry.name.clone(), entry.target.clone(), None, entry.kind, Some(entry.at)));
             }
         }
-        for target in &recent.targets {
+        for target in recent.targets.iter().filter(|t| !self.ignored(t)) {
             let key = predict::key(target);
             if seen.insert(key.clone()) {
                 list.push(ranked(key, display_name(target), target.clone(), None, kind(target), None));
