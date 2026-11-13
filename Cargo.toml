@@ -1,6 +1,6 @@
 [package]
 name = "qrun"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "A lightweight launcher for Windows, built with Rust and GPUI"
 license = "Apache-2.0"
